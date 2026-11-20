@@ -24,6 +24,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPointer>
 #include <QProgressBar>
 #include <QResizeEvent>
 #include <QShortcut>
@@ -1765,27 +1766,43 @@ void SftpBrowserWidget::editSelected()
             editor->setAttribute(Qt::WA_DeleteOnClose);
             editor->setFileLabel(remote);
             editor->setPlainText(QString::fromUtf8(data));
+            QPointer<TextEditor> editorGuard(editor);
             connect(editor, &TextEditor::saveRequested, this,
-                    [this, remote](const QString &content) {
+                    [this, editorGuard, remote](const QString &content) {
                         SftpClient *sftp = m_sftp;
-                        if (!sftp)
+                        if (!sftp) {
+                            if (editorGuard)
+                                editorGuard->notifySaveFailed(tr("连接已断开"));
                             return;
+                        }
                         const QByteArray bytes = content.toUtf8();
                         const auto connection = m_shuttingDown;
                         QPointer<SftpBrowserWidget> self(this);
-                        QThread *w = QThread::create([this, self, sftp, remote, bytes, connection]() {
-                            SshError err;
-                            const bool ok = sftp->writeFile(remote, bytes, err);
-                            const QString msg = err.message;
-                            if (connection->load() || !self)
-                                return;
-                            QMetaObject::invokeMethod(self, [this, remote, ok, msg, connection]() {
-                                if (connection->load())
+                        QThread *w = QThread::create(
+                            [this, self, editorGuard, sftp, remote, bytes, content, connection]() {
+                                SshError err;
+                                const bool ok = sftp->writeFile(remote, bytes, err);
+                                const QString msg = err.message;
+                                if (connection->load() || !self)
                                     return;
-                                setStatusText(ok ? tr("已保存：%1").arg(remote)
-                                                     : tr("保存失败：%1").arg(msg));
-                            }, Qt::QueuedConnection);
-                        });
+                                QMetaObject::invokeMethod(
+                                    self,
+                                    [this, editorGuard, remote, content, ok, msg, connection]() {
+                                        if (connection->load())
+                                            return;
+                                        setStatusText(ok ? tr("已保存：%1").arg(remote)
+                                                         : tr("保存失败：%1").arg(msg));
+                                        // 编辑器可能在后台 I/O 期间被销毁，QPointer 防止悬空回调。
+                                        // content 用于识别写回期间是否又产生了新修改。
+                                        if (editorGuard) {
+                                            if (ok)
+                                                editorGuard->notifySaveSucceeded(content);
+                                            else
+                                                editorGuard->notifySaveFailed(msg);
+                                        }
+                                    },
+                                    Qt::QueuedConnection);
+                            });
                         startWorker(w);
                     });
             editor->show();

@@ -8,6 +8,7 @@
 #include <QSyntaxHighlighter>
 #include <QTextCharFormat>
 
+class QKeyEvent;
 class QPaintEvent;
 class QResizeEvent;
 
@@ -61,19 +62,35 @@ public:
     int lineNumberAreaWidth() const;
     void lineNumberAreaPaintEvent(QPaintEvent *event);
 
-    // 查找（支持正则/大小写/反向；未找到时从头/尾循环）。
-    // 对应Python: CodeEditor.find_text
+    // 查找支持正则、大小写、全词和反向查找；到文档边界后自动循环。
     bool findText(const QString &text, bool regex = false,
-                  bool caseSensitive = false, bool backward = false);
-    // 替换当前选中并定位下一处。对应Python: CodeEditor.replace_text
+                  bool caseSensitive = false, bool backward = false,
+                  bool wholeWord = false);
+    // 当前选区确为查找结果时才替换，随后定位下一处；否则只定位第一处。
     bool replaceText(const QString &text, const QString &newText,
-                     bool regex = false, bool caseSensitive = false);
-    // 全部替换，返回替换次数。对应Python: CodeEditor.replace_all
+                     bool regex = false, bool caseSensitive = false,
+                     bool wholeWord = false);
+    // 全文替换并归入同一次撤销操作，返回实际替换次数。
     int replaceAll(const QString &text, const QString &newText,
-                   bool regex = false, bool caseSensitive = false);
+                   bool regex = false, bool caseSensitive = false,
+                   bool wholeWord = false);
+
+    // 统计并高亮全文匹配项。返回匹配数，正则无效时返回 -1。
+    // 最多绘制 2000 处高亮，但匹配计数始终覆盖全文，避免大文档卡顿。
+    int highlightMatches(const QString &text, bool regex = false,
+                         bool caseSensitive = false, bool wholeWord = false);
+    void clearSearchHighlights();
+    int searchMatchCount() const { return m_searchMatches.size(); }
+    // 当前光标选区在全部匹配项中的序号（从 1 开始；不在匹配项上返回 0）。
+    int currentSearchMatchIndex() const;
+
+    // 跳转到指定行并滚动到可视区域；行号从 1 开始。
+    bool goToLine(int line);
+    bool wordWrapEnabled() const { return lineWrapMode() != QPlainTextEdit::NoWrap; }
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
 private slots:
     void updateLineNumberAreaWidth(int newBlockCount);
@@ -82,15 +99,17 @@ private slots:
 
 private:
     void matchBrackets(QList<QTextEdit::ExtraSelection> &selections);
-    void matchLeftBracket(const QTextCursor &cursor, QChar rightBracket,
-                          QList<QTextEdit::ExtraSelection> &selections);
-    void matchRightBracket(const QTextCursor &cursor, QChar leftBracket,
-                           QList<QTextEdit::ExtraSelection> &selections);
-    void createBracketSelection(int pos, QList<QTextEdit::ExtraSelection> &selections);
+    void createBracketSelection(int pos,
+                                QList<QTextEdit::ExtraSelection> &selections) const;
+    void indentSelectedLines(bool indent);
+    void insertAutoIndentedNewline();
 
     LineNumberArea *m_lineNumberArea = nullptr;
     Highlighter *m_highlighter = nullptr;
     QTextCharFormat m_bracketFormat;
+    QTextCharFormat m_searchFormat;
+    QList<QTextCursor> m_searchMatches;
+    QList<QTextEdit::ExtraSelection> m_searchSelections;
 };
 
 } // namespace cubeshell

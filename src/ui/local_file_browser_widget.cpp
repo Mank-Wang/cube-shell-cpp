@@ -26,6 +26,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPointer>
 #ifndef CUBESHELL_PLATFORM_OHOS
 #include <QProcess>
 #endif
@@ -642,16 +643,28 @@ void LocalFileBrowserWidget::editSelected()
     editor->setAttribute(Qt::WA_DeleteOnClose);
     editor->setFileLabel(path);
     editor->setPlainText(QString::fromUtf8(data));
-    connect(editor, &TextEditor::saveRequested, this, [this, path](const QString &content) {
-        // QSaveFile：写临时文件后原子替换，避免写到一半损坏原文件
-        QSaveFile out(path);
-        if (!out.open(QIODevice::WriteOnly) ||
-            out.write(content.toUtf8()) < 0 || !out.commit()) {
-            QMessageBox::warning(this, tr("编辑文本"), tr("保存失败：%1").arg(path));
-            return;
-        }
-        refreshDirectory(QFileInfo(path).absolutePath());
-    });
+    QPointer<TextEditor> editorGuard(editor);
+    connect(editor, &TextEditor::saveRequested, this,
+            [this, editorGuard, path](const QString &content) {
+                // QSaveFile：写临时文件后原子替换，避免写到一半损坏原文件。
+                // 保存结果必须回告编辑器；只有成功后它才会清除未保存标记。
+                const QByteArray bytes = content.toUtf8();
+                QSaveFile out(path);
+                const bool saved = out.open(QIODevice::WriteOnly)
+                    && out.write(bytes) == bytes.size() && out.commit();
+                if (!saved) {
+                    const QString error = out.errorString().isEmpty()
+                        ? path : out.errorString();
+                    if (editorGuard)
+                        editorGuard->notifySaveFailed(error);
+                    QMessageBox::warning(this, tr("编辑文本"),
+                                         tr("保存失败：%1\n%2").arg(path, error));
+                    return;
+                }
+                if (editorGuard)
+                    editorGuard->notifySaveSucceeded(content);
+                refreshDirectory(QFileInfo(path).absolutePath());
+            });
     editor->show();
 }
 
