@@ -1,5 +1,6 @@
 #include "local_file_browser_widget.h"
 
+#include "config/GlobalState.h"
 #include "file_browser_common.h"
 #include "file_icons.h"
 #include "pane_badge.h"
@@ -138,6 +139,8 @@ LocalFileBrowserWidget::LocalFileBrowserWidget(QWidget *parent)
     m_tree->setRootIsDecorated(true);
     m_tree->setIndentation(16);
     m_tree->setExpandsOnDoubleClick(false);
+    // 本地与远程文件树共用 SFTP 列表字号，保证两个面板的外观一致。
+    setFontSize(GlobalState::instance().sftpListFontSize());
     m_tree->setUniformRowHeights(true);
     m_tree->setSelectionMode(QTreeWidget::ExtendedSelection);
     // 列宽可拖动、总宽超出面板时出现水平滚动条（与 SFTP 浏览器一致）。
@@ -205,6 +208,11 @@ void LocalFileBrowserWidget::setRootPath(const QString &path)
     m_rootPath = clean;
     m_pathEdit->setText(clean);
     populate(preserveTree);
+}
+
+void LocalFileBrowserWidget::setFontSize(int pointSize)
+{
+    setFileTreeFontSize(m_tree, pointSize);
 }
 
 // 刷新路径栏左侧的分屏徽章。单分屏时隐藏，完整信息走 tooltip。

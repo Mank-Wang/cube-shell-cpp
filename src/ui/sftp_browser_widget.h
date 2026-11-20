@@ -54,6 +54,9 @@ public:
     void setCurrentPath(const QString &path);
     QString currentPath() const { return m_cwd; }
 
+    // 设置文件目录树字号。已有节点与后续懒加载节点均自动继承，无需重建树。
+    void setFontSize(int pointSize);
+
     // 标记该会话是经跳板机（JumpServer/koko）代理建立的。
     // 代理端的 SFTP 子系统是一套与资产无关的虚拟命名空间：token 会话下根目录
     // 为空、资产上的任何绝对路径都打不开。有了这个标记才能在面板上给出准确

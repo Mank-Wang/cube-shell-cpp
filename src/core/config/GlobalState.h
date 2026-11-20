@@ -237,6 +237,12 @@ public:
     int deviceListFontSize() const;
     void setDeviceListFontSize(int pointSize);
 
+    // SFTP 文件列表字号 (theme.json 的 "sftp_list_font_size")。
+    // 远程 SFTP 与本地连接共用这一设置，保证两个文件目录树外观一致；
+    // 与终端字号、设备列表字号相互独立，默认 14pt。
+    int sftpListFontSize() const;
+    void setSftpListFontSize(int pointSize);
+
 private:
     GlobalState() = default;
 

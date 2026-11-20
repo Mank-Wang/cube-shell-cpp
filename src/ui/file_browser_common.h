@@ -67,6 +67,12 @@ bool fileTreeSortLess(int column, Qt::SortOrder order,
 // fileTreeSortLess 排序后原序插回（不销毁 item，选中态/展开态/隐藏态都保留）。
 void sortFileTree(QTreeWidget *tree, int column, Qt::SortOrder order);
 
+// ---- 列表字号 -------------------------------------------------------------
+// 设置文件目录树的字号，不逐个修改 item：已有节点与后续懒加载节点都会继承
+// 树控件字体。桌面平台使用磅值；OHOS 使用像素值并显式考虑屏幕密度，规避
+// 平台插件 setPointSize 不随 devicePixelRatio 缩放的问题。非法字号直接忽略。
+void setFileTreeFontSize(QTreeWidget *tree, int pointSize);
+
 // ---- 筛选按钮图标 ---------------------------------------------------------
 // 手绘放大镜（QPainter），随调色板着色，深浅色主题下都可见；
 // 资源包里本没有搜索图标，免得为一个 16px 图标新增二进制资源。

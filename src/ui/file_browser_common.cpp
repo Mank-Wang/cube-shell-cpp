@@ -1,6 +1,7 @@
 #include "file_browser_common.h"
 
 #include <QItemSelectionModel>
+#include <QFont>
 #include <QPainter>
 #include <QPalette>
 #include <QPixmap>
@@ -170,6 +171,21 @@ void sortFileTree(QTreeWidget *tree, int column, Qt::SortOrder order)
         item->setSelected(true);
     if (currentItem)
         tree->setCurrentItem(currentItem, 0, QItemSelectionModel::NoUpdate);
+}
+
+void setFileTreeFontSize(QTreeWidget *tree, int pointSize)
+{
+    if (!tree || pointSize <= 0)
+        return;
+    QFont font = tree->font(); // 保留系统字体族、字重等既有外观，只覆盖字号
+#ifdef CUBESHELL_PLATFORM_OHOS
+    // pt → px → 物理像素：96/72 是标准 DPI 换算，devicePixelRatioF 补上
+    // 鸿蒙平台插件遗漏的屏幕密度。树控件会自行把行高和表头一起更新。
+    font.setPixelSize(qRound(pointSize * 96.0 / 72.0 * tree->devicePixelRatioF()));
+#else
+    font.setPointSize(pointSize);
+#endif
+    tree->setFont(font);
 }
 
 // ---- 筛选按钮图标 ---------------------------------------------------------

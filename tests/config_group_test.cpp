@@ -274,6 +274,13 @@ static void testGlobalState()
     gs.setFont(QStringLiteral("Menlo"), 16);
     CHECK(gs.fontFamily() == QStringLiteral("Menlo") && gs.fontSize() == 16);
 
+    // SFTP 列表字号：旧配置没有该键时使用 14pt；显式修改后独立读回，
+    // 不跟随刚才设置的终端字号 16pt。这里只改内存，不写真实 theme.json。
+    CHECK(gs.sftpListFontSize() == 14);
+    gs.setSftpListFontSize(18);
+    CHECK(gs.sftpListFontSize() == 18);
+    CHECK(gs.fontSize() == 16);
+
     // 命令补全开关：theme.json 里没有该键时缺省 true（与加开关之前的行为一致），
     // 显式关闭后能读回 false。
     CHECK(gs.commandCompletionEnabled());

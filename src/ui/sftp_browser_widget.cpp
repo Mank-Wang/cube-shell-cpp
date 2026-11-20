@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "config/GlobalState.h"
 #include "ssh/SshClient.h"
 #include "ssh/CommandExecutor.h"
 #include "ssh/SftpUploaderCore.h"
@@ -196,6 +197,8 @@ SftpBrowserWidget::SftpBrowserWidget(QWidget *parent)
     m_tree->setRootIsDecorated(true);
     m_tree->setIndentation(16);
     m_tree->setExpandsOnDoubleClick(false);
+    // 构造时读取全局设置；运行中由 MainWindow 接收设置信号并调 setFontSize。
+    setFontSize(GlobalState::instance().sftpListFontSize());
     m_tree->setUniformRowHeights(true);
     m_tree->setSelectionMode(QTreeWidget::ExtendedSelection);
     // 列宽可拖动、总宽超出面板时出现水平滚动条。
@@ -551,6 +554,11 @@ void SftpBrowserWidget::setCurrentPath(const QString &path)
         return;
     // CwdSync：终端 cwd 与 SFTP 通道未必是同一命名空间，失败不弹错误。
     loadPath(clean, LoadReason::CwdSync);
+}
+
+void SftpBrowserWidget::setFontSize(int pointSize)
+{
+    setFileTreeFontSize(m_tree, pointSize);
 }
 
 // 刷新路径栏左侧的分屏徽章。单分屏时隐藏，完整信息走 tooltip。

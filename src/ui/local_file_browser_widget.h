@@ -26,6 +26,9 @@ public:
     void setRootPath(const QString &path);
     QString rootPath() const { return m_rootPath; }
 
+    // 设置文件目录树字号，与 SftpBrowserWidget 共用同一设置和渲染逻辑。
+    void setFontSize(int pointSize);
+
     // 在路径栏左侧显示/隐藏分屏序号徽章（与 SftpBrowserWidget 同款）。
     // paneNumber: 当前分屏序号（1-based）；totalPanes: 总分屏数（≤1 时隐藏徽章）；
     // tabTitle: 用于 tooltip 的标签名，展示完整的“分屏 N · 标签名”。

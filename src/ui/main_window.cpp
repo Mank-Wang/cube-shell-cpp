@@ -3439,6 +3439,17 @@ void MainWindow::showSettings(int tabIndex)
                 if (m_deviceList)
                     m_deviceList->setFontSize(pointSize);
             });
+    // 文件列表字号即时应用到所有已打开面板；新建面板会在构造函数里读取
+    // GlobalState。这里只改树控件字体，不重建节点，展开状态与选中状态不受影响。
+    connect(&dlg, &SettingsDialog::sftpListFontSizeChanged, this,
+            [this](int pointSize) {
+                const QList<SftpBrowserWidget *> sftpBrowsers = findChildren<SftpBrowserWidget *>();
+                for (SftpBrowserWidget *browser : sftpBrowsers)
+                    browser->setFontSize(pointSize);
+                const QList<LocalFileBrowserWidget *> localBrowsers = findChildren<LocalFileBrowserWidget *>();
+                for (LocalFileBrowserWidget *browser : localBrowsers)
+                    browser->setFontSize(pointSize);
+            });
     // 切换 dark/light 后重建标签页 QSS（颜色按新主题取值），无需重启。
     connect(&dlg, &SettingsDialog::appearanceChanged, this, [this](const QString &) {
         for (TerminalTabWidget *tabs : std::as_const(m_panes))

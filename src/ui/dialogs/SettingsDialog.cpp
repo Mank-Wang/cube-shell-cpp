@@ -56,6 +56,7 @@ static const char kLanguage[]   = "settings/language";
 static const char kFontFamily[] = "settings/font_family";
 static const char kFontSize[]   = "settings/font_size";
 static const char kDeviceListFontSize[] = "settings/device_list_font_size";
+static const char kSftpListFontSize[] = "settings/sftp_list_font_size";
 static const char kSshTimeout[] = "settings/ssh_timeout";
 static const char kEncoding[]   = "settings/terminal_encoding";
 static const char kScrollback[] = "settings/scrollback_lines";
@@ -176,6 +177,15 @@ QWidget *SettingsDialog::createGeneralTab()
     m_deviceListFontSize->setRange(8, 40);
     unifyFieldWidth(m_deviceListFontSize);
     form->addRow(tr("设备列表字体大小:"), m_deviceListFontSize);
+
+    // 文件目录树字号独立于终端和设备列表；名称沿用“SFTP 列表”，实际同时
+    // 应用于本地连接与远程连接，避免同一文件区域在两种会话下字号不一致。
+    m_sftpListFontSize = new QSpinBox(page);
+    m_sftpListFontSize->setObjectName(QStringLiteral("sftpListFontSize"));
+    m_sftpListFontSize->setRange(8, 40);
+    m_sftpListFontSize->setToolTip(tr("本地与远程 SFTP 文件目录树的字号，保存后立即生效。"));
+    unifyFieldWidth(m_sftpListFontSize);
+    form->addRow(tr("SFTP 列表字体大小:"), m_sftpListFontSize);
 
     m_sshTimeout = new QSpinBox(page);
     m_sshTimeout->setRange(5, 600);
@@ -347,6 +357,8 @@ void SettingsDialog::loadCurrentSettings()
     m_fontSize->setValue(qs.value(settings_keys::kFontSize, state.fontSize()).toInt());
     m_deviceListFontSize->setValue(
         qs.value(settings_keys::kDeviceListFontSize, state.deviceListFontSize()).toInt());
+    m_sftpListFontSize->setValue(
+        qs.value(settings_keys::kSftpListFontSize, state.sftpListFontSize()).toInt());
 
     m_sshTimeout->setValue(qs.value(
         settings_keys::kSshTimeout,
@@ -437,6 +449,10 @@ void SettingsDialog::accept()
     const bool deviceListFontDirty = deviceListSize != state.deviceListFontSize();
     state.setDeviceListFontSize(deviceListSize);
 
+    const int sftpListSize = m_sftpListFontSize->value();
+    const bool sftpListFontDirty = sftpListSize != state.sftpListFontSize();
+    state.setSftpListFontSize(sftpListSize);
+
     state.setSshConnectTimeoutSeconds(m_sshTimeout->value());
     state.setHostKeyVerification(m_hostKeyVerification->currentData().toInt());
     state.setSshKeepaliveEnabled(m_keepaliveEnabled->isChecked());
@@ -469,6 +485,7 @@ void SettingsDialog::accept()
     qs.setValue(settings_keys::kFontFamily, family);
     qs.setValue(settings_keys::kFontSize, size);
     qs.setValue(settings_keys::kDeviceListFontSize, deviceListSize);
+    qs.setValue(settings_keys::kSftpListFontSize, sftpListSize);
     qs.setValue(settings_keys::kSshTimeout, m_sshTimeout->value());
     qs.setValue(settings_keys::kEncoding, m_encoding->currentText());
     qs.setValue(settings_keys::kScrollback, scrollback);
@@ -489,6 +506,8 @@ void SettingsDialog::accept()
         emit fontChanged(family, size);
     if (deviceListFontDirty)
         emit deviceListFontSizeChanged(deviceListSize);
+    if (sftpListFontDirty)
+        emit sftpListFontSizeChanged(sftpListSize);
     if (scrollbackDirty)
         emit scrollbackLinesChanged(scrollback);
     if (completionDirty)

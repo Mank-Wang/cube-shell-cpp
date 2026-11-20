@@ -58,6 +58,8 @@ signals:
     void fontChanged(const QString &family, int pointSize);
     // 设备列表字号已修改，设备列表可即时应用。
     void deviceListFontSizeChanged(int pointSize);
+    // SFTP 文件列表字号已修改；本地与远程文件目录树都可即时应用。
+    void sftpListFontSizeChanged(int pointSize);
     // 回滚行数已修改，已打开的终端可即时应用（setHistorySize）。
     void scrollbackLinesChanged(int lines);
     // 命令补全开关已修改，已打开的终端可即时生效（无需重开会话）。
@@ -76,6 +78,7 @@ private:
     QFontComboBox *m_fontFamily = nullptr;
     QSpinBox *m_fontSize = nullptr;
     QSpinBox *m_deviceListFontSize = nullptr; // 设备列表字号
+    QSpinBox *m_sftpListFontSize = nullptr;   // 本地/远程文件目录树字号
     QSpinBox *m_sshTimeout = nullptr;     // 秒
     QComboBox *m_encoding = nullptr;      // UTF-8 / GBK / GB2312
     QSpinBox *m_scrollback = nullptr;     // 终端回滚行数（搜索可检索的范围）

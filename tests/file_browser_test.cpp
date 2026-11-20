@@ -12,13 +12,16 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QSpinBox>
 #include <QString>
 #include <QTemporaryDir>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 
 #include "file_browser_common.h"
+#include "dialogs/SettingsDialog.h"
 #include "local_file_browser_widget.h"
+#include "sftp_browser_widget.h"
 
 using namespace cubeshell;
 
@@ -341,6 +344,45 @@ static void testLocalLazyLoadingTree()
     CHECK(directChild(sub, QStringLiteral("deep.txt")));
 }
 
+// 本地与远程面板使用同一个字号入口；无效值不能破坏当前字体。
+static void testFileTreeFontSize()
+{
+    LocalFileBrowserWidget local;
+    SftpBrowserWidget remote;
+    local.setFontSize(19);
+    remote.setFontSize(19);
+    auto *localTree = local.findChild<QTreeWidget *>();
+    auto *remoteTree = remote.findChild<QTreeWidget *>();
+    CHECK(localTree && remoteTree);
+    if (!localTree || !remoteTree)
+        return;
+#ifdef CUBESHELL_PLATFORM_OHOS
+    CHECK(localTree->font().pixelSize() > 0);
+    CHECK(remoteTree->font().pixelSize() > 0);
+#else
+    CHECK(localTree->font().pointSize() == 19);
+    CHECK(remoteTree->font().pointSize() == 19);
+#endif
+    local.setFontSize(0);
+    remote.setFontSize(-1);
+#ifndef CUBESHELL_PLATFORM_OHOS
+    CHECK(localTree->font().pointSize() == 19);
+    CHECK(remoteTree->font().pointSize() == 19);
+#endif
+}
+
+// 通用设置页确实包含独立的 SFTP 列表字号控件；只构造和读取，不落盘。
+static void testSftpFontSettingControl()
+{
+    SettingsDialog dialog;
+    auto *size = dialog.findChild<QSpinBox *>(QStringLiteral("sftpListFontSize"));
+    CHECK(size);
+    if (size) {
+        CHECK(size->minimum() == 8);
+        CHECK(size->maximum() == 40);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     // sortFileTree/applyFileFilter 要建 QTreeWidget，需要 QApplication；
@@ -356,6 +398,8 @@ int main(int argc, char *argv[])
     testApplyFileFilterEndToEnd();
     testNestedTreeSortAndFilter();
     testLocalLazyLoadingTree();
+    testFileTreeFontSize();
+    testSftpFontSettingControl();
     if (failures) {
         qWarning() << failures << "check(s) failed";
         return 1;

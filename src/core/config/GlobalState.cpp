@@ -496,4 +496,18 @@ void GlobalState::setDeviceListFontSize(int pointSize)
     m_theme.insert(QStringLiteral("device_list_font_size"), pointSize);
 }
 
+// 文件目录树字号。与设备列表一样使用独立配置键，避免调整文件列表时
+// 意外改变终端字体；缺省 14pt，与应用的通用字号保持一致。
+int GlobalState::sftpListFontSize() const
+{
+    QMutexLocker lock(&m_themeMutex);
+    return m_theme.value(QStringLiteral("sftp_list_font_size")).toInt(14);
+}
+
+void GlobalState::setSftpListFontSize(int pointSize)
+{
+    QMutexLocker lock(&m_themeMutex);
+    m_theme.insert(QStringLiteral("sftp_list_font_size"), pointSize);
+}
+
 } // namespace cubeshell
