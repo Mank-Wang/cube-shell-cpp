@@ -11,6 +11,7 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
 #include <QUuid>
 
 #include <functional>
@@ -47,10 +48,11 @@ static QString statusText(const SftpBrowserWidget &browser)
 static QTreeWidgetItem *findEntry(SftpBrowserWidget &browser, const QString &name)
 {
     auto *tree = browser.findChild<QTreeWidget *>();
-    for (int i = 0; i < tree->topLevelItemCount(); ++i) {
-        auto *item = tree->topLevelItem(i);
-        if (item->text(0) == name)
-            return item;
+    QTreeWidgetItemIterator it(tree);
+    while (*it) {
+        if ((*it)->text(0) == name)
+            return *it;
+        ++it;
     }
     return nullptr;
 }
@@ -195,8 +197,17 @@ static int testLiveReconnect()
     if (child) {
         CHECK(QMetaObject::invokeMethod(&browser, "onItemDoubleClicked", Qt::DirectConnection,
                                        Q_ARG(QTreeWidgetItem *, child), Q_ARG(int, 0)));
-        CHECK(waitUntil([&]() { return browser.currentPath() == base + QStringLiteral("/child"); }));
-        CHECK(findEntry(browser, QStringLiteral("hello.txt")));
+        // 双击目录改为原地展开并懒加载，不再清空整棵树或切换根目录。
+        CHECK(waitUntil([&]() {
+            for (int i = 0; i < child->childCount(); ++i) {
+                if (child->child(i)->text(0) == QStringLiteral("hello.txt"))
+                    return true;
+            }
+            return false;
+        }));
+        CHECK(browser.currentPath() == base);
+        CHECK(child->isExpanded());
+        CHECK(findEntry(browser, QStringLiteral("child")) == child);
     }
 
     QTemporaryDir local;

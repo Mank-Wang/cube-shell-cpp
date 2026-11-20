@@ -10,11 +10,15 @@
 
 #include <QApplication>
 #include <QDebug>
+#include <QDir>
+#include <QFile>
 #include <QString>
+#include <QTemporaryDir>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 
 #include "file_browser_common.h"
+#include "local_file_browser_widget.h"
 
 using namespace cubeshell;
 
@@ -218,6 +222,125 @@ static void testApplyFileFilterEndToEnd()
         CHECK(!tree.topLevelItem(i)->isHidden());
 }
 
+// 多层级 SFTP 树：排序只在兄弟节点之间进行；筛选命中深层文件时保留祖先，
+// 未加载目录的占位项不参与匹配或计数。
+static void testNestedTreeSortAndFilter()
+{
+    QTreeWidget tree;
+    tree.setColumnCount(5);
+    auto *folder = new QTreeWidgetItem(&tree);
+    folder->setText(0, QStringLiteral("folder"));
+    folder->setData(0, kIsDirRole, true);
+    const auto addChild = [folder](const QString &name) {
+        auto *item = new QTreeWidgetItem(folder);
+        item->setText(0, name);
+        return item;
+    };
+    addChild(QStringLiteral("z-last"));
+    addChild(QStringLiteral("needle.txt"));
+    addChild(QStringLiteral("a-first"));
+    auto *placeholder = addChild(QStringLiteral("正在加载…"));
+    placeholder->setData(0, kIsPlaceholderRole, true);
+
+    tree.expandItem(folder);
+    tree.setCurrentItem(folder->child(1)); // needle.txt
+    sortFileTree(&tree, 0, Qt::AscendingOrder);
+    CHECK(folder->isExpanded()); // 排序不能把用户已经展开的分支收起
+    CHECK(tree.currentItem() && tree.currentItem()->text(0) == QStringLiteral("needle.txt"));
+    CHECK(tree.currentItem()->isSelected());
+    CHECK(folder->child(0)->text(0) == QStringLiteral("a-first"));
+    CHECK(folder->child(1)->text(0) == QStringLiteral("needle.txt"));
+    CHECK(folder->child(2)->text(0) == QStringLiteral("z-last"));
+
+    int visible = applyFileFilter(&tree, QStringLiteral("needle"));
+    CHECK(visible == 1);
+    CHECK(!folder->isHidden()); // 自身不匹配，但它是命中项的祖先
+    CHECK(folder->child(0)->isHidden());
+    CHECK(!folder->child(1)->isHidden());
+    CHECK(folder->child(2)->isHidden());
+    CHECK(placeholder->isHidden());
+
+    visible = applyFileFilter(&tree, QString());
+    CHECK(visible == 4); // 顶层目录 + 三个真实子项，不含占位项
+    CHECK(!folder->isHidden());
+    CHECK(!placeholder->isHidden()); // 清空筛选后恢复加载提示
+}
+
+// 本地面板端到端：使用临时目录验证与 SFTP 相同的懒加载树交互，不访问网络。
+static void testLocalLazyLoadingTree()
+{
+    QTemporaryDir tmp;
+    CHECK(tmp.isValid());
+    const QString root = tmp.path();
+    CHECK(QDir().mkpath(root + QStringLiteral("/alpha/sub")));
+    QFile deep(root + QStringLiteral("/alpha/sub/deep.txt"));
+    CHECK(deep.open(QIODevice::WriteOnly));
+    CHECK(deep.write("deep") == 4);
+    deep.close();
+    QFile top(root + QStringLiteral("/top.txt"));
+    CHECK(top.open(QIODevice::WriteOnly));
+    top.close();
+
+    LocalFileBrowserWidget browser;
+    browser.setRootPath(root);
+    auto *tree = browser.findChild<QTreeWidget *>();
+    CHECK(tree);
+    if (!tree)
+        return;
+    CHECK(tree->rootIsDecorated());
+    CHECK(tree->indentation() > 0);
+    const auto topLevel = [tree](const QString &name) -> QTreeWidgetItem * {
+        for (int i = 0; i < tree->topLevelItemCount(); ++i) {
+            QTreeWidgetItem *item = tree->topLevelItem(i);
+            if (item->text(0) == name)
+                return item;
+        }
+        return nullptr;
+    };
+    const auto directChild = [](QTreeWidgetItem *parent, const QString &name) -> QTreeWidgetItem * {
+        for (int i = 0; i < parent->childCount(); ++i) {
+            if (parent->child(i)->text(0) == name)
+                return parent->child(i);
+        }
+        return nullptr;
+    };
+    const auto doubleClick = [&browser](QTreeWidgetItem *item) {
+        return QMetaObject::invokeMethod(&browser, "onItemDoubleClicked", Qt::DirectConnection,
+                                         Q_ARG(QTreeWidgetItem *, item), Q_ARG(int, 0));
+    };
+
+    QTreeWidgetItem *alpha = topLevel(QStringLiteral("alpha"));
+    CHECK(alpha);
+    if (!alpha)
+        return;
+    CHECK(alpha->childCount() == 1); // 未加载目录只有占位项
+    CHECK(alpha->child(0)->data(0, kIsPlaceholderRole).toBool());
+    CHECK(doubleClick(alpha));
+    CHECK(browser.rootPath() == root); // 展开不改变树根
+    CHECK(alpha->isExpanded());
+    QTreeWidgetItem *sub = directChild(alpha, QStringLiteral("sub"));
+    CHECK(sub);
+    if (!sub)
+        return;
+    CHECK(doubleClick(sub));
+    CHECK(sub->isExpanded());
+    CHECK(directChild(sub, QStringLiteral("deep.txt")));
+
+    // 从顶层文件触发根目录刷新，两个已展开层级都必须保留。
+    tree->setCurrentItem(topLevel(QStringLiteral("top.txt")));
+    CHECK(QMetaObject::invokeMethod(&browser, "refresh", Qt::DirectConnection));
+    CHECK(alpha->isExpanded());
+    CHECK(sub->isExpanded());
+    CHECK(directChild(sub, QStringLiteral("deep.txt")));
+
+    CHECK(doubleClick(alpha));
+    CHECK(!alpha->isExpanded());
+    CHECK(browser.rootPath() == root);
+    CHECK(doubleClick(alpha)); // 已加载分支重新展开，不丢失子项
+    CHECK(alpha->isExpanded());
+    CHECK(directChild(sub, QStringLiteral("deep.txt")));
+}
+
 int main(int argc, char *argv[])
 {
     // sortFileTree/applyFileFilter 要建 QTreeWidget，需要 QApplication；
@@ -231,6 +354,8 @@ int main(int argc, char *argv[])
     testTextColumns();
     testSortFileTreeEndToEnd();
     testApplyFileFilterEndToEnd();
+    testNestedTreeSortAndFilter();
+    testLocalLazyLoadingTree();
     if (failures) {
         qWarning() << failures << "check(s) failed";
         return 1;

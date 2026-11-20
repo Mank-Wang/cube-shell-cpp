@@ -2,12 +2,12 @@
 
 // SftpBrowserWidget.h — remote file browser panel (SFTP).
 //
-// A flat list of the remote working directory backed by SftpClient over an
-// already-open SshClient, mirroring the Python left-panel file tree
-// (cube-shell.py::handle_file_tree_updated): path bar on top, ".." row to go
-// up, double-click a directory to descend, all operations on the context
-// menu. Listing runs on a worker thread so the UI stays responsive (the
-// SftpClient serializes libssh2 internally).
+// A lazy-loading tree of the remote file system backed by SftpClient over an
+// already-open SshClient. The path bar identifies the tree's root directory;
+// expanding or double-clicking a directory loads only that node's children,
+// leaving every other loaded branch visible. All operations remain on the
+// context menu. Listing runs on worker threads so the UI stays responsive
+// (SftpClient serializes libssh2 internally).
 
 #include <QHash>
 #include <QPointer>
@@ -48,8 +48,8 @@ public:
     // SftpClient::close() 再用悬空的 m_sftp 调 libssh2_sftp_shutdown → UAF 崩溃。
     void setClient(std::shared_ptr<SshClient> client);
 
-    // 切换当前目录（follow_folder 联动 / OSC7 初始 home 目录）。
-    // 客户端尚未挂接时仅记录路径，setClient 时再加载。
+    // 切换整棵树的根目录（follow_folder 联动 / OSC7 初始 home 目录）。
+    // 客户端尚未挂接时仅记录路径，setClient 时再加载；展开子目录不改变它。
     // 对应Python: cube-shell.py::_on_cwd_changed → refreshDirs
     void setCurrentPath(const QString &path);
     QString currentPath() const { return m_cwd; }
@@ -116,6 +116,7 @@ protected:
 
 private slots:
     void onItemDoubleClicked(QTreeWidgetItem *item, int column);
+    void onItemExpanded(QTreeWidgetItem *item);
     void goUp();
     void refresh();
     void mkdir();
@@ -147,7 +148,7 @@ private slots:
 
 private:
     // 目录加载的触发来源，决定失败时怎么表现。
-    //  UserRequested — 用户主动导航（双击/路径栏/刷新/上一级）：失败必须报错，
+    //  UserRequested — 用户主动导航（路径栏/刷新/上一级）：失败必须报错，
     //                  否则用户不知道自己点的地方去不了。
     //  CwdSync       — 终端 OSC 7 上报 cwd 的联动：这是我们替用户猜的，猜错了
     //                  不能弹错误。终端 cwd 与 SFTP 通道可能压根不是同一个
@@ -155,7 +156,15 @@ private:
     //  Initial       — setClient 的首次加载，同样属于推测（m_cwd 可能是连接
     //                  就绪前由 setCurrentPath 种进来的终端 cwd）。
     enum class LoadReason { UserRequested, CwdSync, Initial };
-    void loadPath(const QString &path, LoadReason reason = LoadReason::UserRequested);
+    // 加载并替换整棵树的根目录。preserveTree=true 用于根目录刷新：按文件名
+    // 更新顶层条目，已加载的子孙分支和展开状态不丢。
+    void loadPath(const QString &path, LoadReason reason = LoadReason::UserRequested,
+                  bool preserveTree = false);
+    // 展开节点时的懒加载；force=true 强制重新列目录（刷新）。回调按路径重新
+    // 查找节点并核对请求序号，节点被删除/整树换根后旧结果不会落到新节点上。
+    void loadChildren(QTreeWidgetItem *item, bool force = false);
+    QTreeWidgetItem *findDirectoryItem(const QString &path) const;
+    QString currentDirectoryPath() const;
     // 清空列表并显示「代理端不提供 SFTP 文件浏览」的说明行 + 状态栏文案。
     // 对应Python: cube-shell.py::_on_file_tree_unavailable（清空树 + 提示）
     void showUnavailableNotice();
@@ -169,7 +178,12 @@ private:
     void startWorker(QThread *worker);
     // 重连与析构共用：使旧回调失效、停线程，并在旧 SSH 仍存活时释放组件。
     void releaseClient();
-    void populate(const QString &path, const SftpFileInfoList &entries);
+    void populate(const QString &path, const SftpFileInfoList &entries,
+                  bool preserveTree = false);
+    // parent=nullptr 表示顶层；只重建这一层的直接子项，目录节点已有的
+    // 已加载子树原样保留。新目录先放一个占位子项，让 Qt 显示展开箭头。
+    void populateDirectory(QTreeWidgetItem *parent, const QString &path,
+                           const SftpFileInfoList &entries);
     // 写底部状态栏：按 label 当前宽度做省略号截断，完整文本放 tooltip，
     // 避免长错误信息把面板撑宽。所有状态输出统一走这里，不要直接 setText。
     void setStatusText(const QString &text);
@@ -250,9 +264,11 @@ private:
     bool m_bastionProxied = false;
     // 已判定「代理端不提供文件浏览」，列表里现在是说明行而非目录内容。
     bool m_sftpUnavailable = false;
-    // 目录加载请求序号：回调仅接受最新请求的结果，防止乱序返回的
-    // 陈旧目录数据覆盖新目录（快速连续双击多个文件夹时）。
+    // 根目录加载请求序号：回调仅接受最新请求的结果，防止乱序返回的
+    // 陈旧目录数据覆盖新目录（快速连续切换根目录时）。
     quint64 m_loadSeq = 0;
+    // 各目录节点共用全局递增的请求序号，但互不取消：用户可同时展开多个目录。
+    quint64 m_dirLoadSeq = 0;
     // 仍可能在运行的自建 worker 线程登记表（元素被 deleteLater 后自动置空）。
     QVector<QPointer<QThread>> m_workers;
     // 当前连接的关停标志：重连/析构时置位，新连接另建一份。worker 和排队

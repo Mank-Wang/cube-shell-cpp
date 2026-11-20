@@ -2,9 +2,9 @@
 
 // file_browser_common.h — 本地/远程文件树面板共用的条目角色、筛选与排序逻辑。
 //
-// 两棵树（LocalFileBrowserWidget / SftpBrowserWidget）同为五列平铺列表
-// （文件名/文件大小/修改日期/权限/所有者），首行可能是 ".." 返回上级条目。
-// 排序与筛选都是纯内存操作：目录数据本就全量在手，不需要任何额外网络往返。
+// 本地与 SFTP 树均为五列多层级懒加载视图；两者共用同一套
+// 条目角色、筛选和按兄弟节点排序的逻辑。树根首行可能是 ".." 返回上级条目。
+// 排序与筛选都是纯内存操作：只处理已经加载的节点，不触发额外网络往返。
 //
 // 可测性约定与本工程一致：比较/匹配抽成纯函数（fileMatchesFilter /
 // fileTreeSortLess），QTreeWidget 只是它们的一层薄壳（sortFileTree /
@@ -28,13 +28,18 @@ constexpr int kIsUpRole = Qt::UserRole + 3;    // ".." 返回上级条目
 constexpr int kSymlinkTargetRole = Qt::UserRole + 4; // 符号链接目标（仅 SFTP 树用）
 constexpr int kSizeRole = Qt::UserRole + 5;    // 裸字节数 qint64（排序用，显示文本是格式化串）
 constexpr int kMtimeRole = Qt::UserRole + 6;   // 裸修改时间 qint64 秒级 epoch（同上）
+constexpr int kIsPlaceholderRole = Qt::UserRole + 7; // 未加载目录的占位子项
+constexpr int kChildrenStateRole = Qt::UserRole + 20; // 本地/SFTP 目录加载状态
+
+enum ChildrenState { ChildrenNotLoaded = 0, ChildrenLoading, ChildrenLoaded };
 
 // ---- 筛选 ---------------------------------------------------------------
 // 文件名子串匹配（忽略大小写）；空 needle 恒真。抽成纯函数便于单测。
 bool fileMatchesFilter(const QString &name, const QString &needle);
 
-// 对整棵树的顶层条目应用筛选：不匹配项隐藏；".." 条目在有筛选词时隐藏
-// （它代表的是上级目录，不参与"当前目录里找东西"）。返回可见的普通条目数。
+// 递归处理所有已加载节点：不匹配项隐藏；目录自身不匹配但后代匹配时保留
+// 该目录，避免把命中项的祖先藏掉。占位项与 ".." 不参与匹配计数。
+// 返回名称自身匹配的条目数（不含仅为命中项保留的祖先目录）。
 int applyFileFilter(QTreeWidget *tree, const QString &needle);
 
 // ---- 排序 ---------------------------------------------------------------
@@ -58,8 +63,8 @@ struct FileSortKey {
 bool fileTreeSortLess(int column, Qt::SortOrder order,
                       const FileSortKey &a, const FileSortKey &b);
 
-// 对整棵树的顶层条目按 column/order 重排：".." 条目恒置顶，其余按
-// fileTreeSortLess 排序后原序插回（不销毁 item，选中态/隐藏态都保留）。
+// 递归对每组兄弟条目按 column/order 重排：顶层 ".." 条目恒置顶，其余按
+// fileTreeSortLess 排序后原序插回（不销毁 item，选中态/展开态/隐藏态都保留）。
 void sortFileTree(QTreeWidget *tree, int column, Qt::SortOrder order);
 
 // ---- 筛选按钮图标 ---------------------------------------------------------

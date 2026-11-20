@@ -3,7 +3,8 @@
 // local_file_browser_widget.h — 本机终端左侧的本地文件目录面板。
 // 对应Python: cube-shell.py 本机终端 (is_local) 分支的文件树
 //（refreshDirs → _get_local_dir_now 本地目录列表）
-// 外观与 SftpBrowserWidget 统一：路径栏 + 五列平铺列表（".." 行返回上级）。
+// 外观与 SftpBrowserWidget 统一：路径栏 + 五列多层级目录树；目录首次展开时
+// 按需读取子项，双击只展开/收起，不再替换整棵树。
 
 #include <QWidget>
 
@@ -21,7 +22,7 @@ class LocalFileBrowserWidget : public QWidget {
 public:
     explicit LocalFileBrowserWidget(QWidget *parent = nullptr);
 
-    // 切换显示的根目录（follow_folder 联动 / 双击进入子目录）。
+    // 切换整棵树的根目录（follow_folder 联动 / 路径栏导航）；展开子目录不改变它。
     void setRootPath(const QString &path);
     QString rootPath() const { return m_rootPath; }
 
@@ -40,6 +41,7 @@ private slots:
     void goHome();
     void onPathEdited();
     void onItemDoubleClicked(QTreeWidgetItem *item, int column);
+    void onItemExpanded(QTreeWidgetItem *item);
     // 表头点击排序：同列切换升降序，换列重置为升序（与 SFTP 面板一致）。
     void onHeaderSectionClicked(int logical);
     // 筛选栏显隐（路径栏右侧筛选按钮 toggled）。打开即聚焦，关闭即清空还原。
@@ -71,7 +73,12 @@ private slots:
 #endif
 
 private:
-    void populate();
+    void populate(bool preserveTree = false);
+    void populateDirectory(QTreeWidgetItem *parent, const QString &path);
+    void loadChildren(QTreeWidgetItem *item, bool force = false);
+    QString currentDirectoryPath() const;
+    void refreshDirectory(const QString &path);
+    void refreshParents(const QStringList &paths);
     // 选中项的绝对路径（排除 ".." 行）。
     QString selectedPath() const;
     QStringList selectedPaths() const;

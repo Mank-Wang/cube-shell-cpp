@@ -33,6 +33,7 @@
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
+#include <QTreeWidgetItemIterator>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -53,6 +54,10 @@ namespace cubeshell {
 
 // 析构时对每个存活 worker 的最长等待；超时则泄漏其引用对象而非无限阻塞 UI。
 static constexpr int kWorkerJoinTimeoutMs = 5000;
+
+// SFTP 目录节点的请求序号。加载状态与占位角色由 file_browser_common.h
+// 统一提供，本地树和 SFTP 树使用同一套状态定义。
+constexpr int kDirLoadSeqRole = Qt::UserRole + 21;
 
 // 条目角色布局（kPathRole/kIsDirRole/kIsUpRole/kModeRole/kSymlinkTargetRole
 // 及排序用的 kSizeRole/kMtimeRole）统一由 file_browser_common.h 提供，
@@ -159,7 +164,7 @@ SftpBrowserWidget::SftpBrowserWidget(QWidget *parent)
     // 筛选开关：点击在路径栏下方弹出检索框，再次点击（或检索框里 Esc）收起。
     m_filterBtn = new QToolButton(this);
     m_filterBtn->setIcon(fileFilterIcon(palette()));
-    m_filterBtn->setToolTip(tr("筛选当前目录（Ctrl+F）"));
+    m_filterBtn->setToolTip(tr("筛选已加载的文件和目录（Ctrl+F）"));
     m_filterBtn->setCheckable(true);
     m_filterBtn->setAutoRaise(true);
 
@@ -171,26 +176,26 @@ SftpBrowserWidget::SftpBrowserWidget(QWidget *parent)
     pathLayout->addWidget(m_pathEdit, 1);
     pathLayout->addWidget(m_filterBtn);
 
-    // 检索框行（默认隐藏）：输入即筛选当前目录，Enter 定位第一个匹配项。
+    // 检索框行（默认隐藏）：输入即筛选所有已加载层级，Enter 定位第一个匹配项。
     m_filterBar = new QWidget(this);
     auto *filterLayout = new QHBoxLayout(m_filterBar);
     filterLayout->setContentsMargins(0, 2, 0, 2);
     filterLayout->setSpacing(4);
     m_filterEdit = new QLineEdit(m_filterBar);
-    m_filterEdit->setPlaceholderText(tr("输入关键字筛选当前目录，Enter 定位，Esc 关闭"));
+    m_filterEdit->setPlaceholderText(tr("筛选已加载的文件和目录，Enter 定位，Esc 关闭"));
     m_filterEdit->setClearButtonEnabled(true);
     filterLayout->addWidget(m_filterEdit, 1);
     m_filterBar->setVisible(false);
 
-    // 平铺列表（非展开树），五列表头与 Python 侧一致。
-    // 对应Python: handle_file_tree_updated 里 setRootIsDecorated(False)/setIndentation(0)
-    // 及 setHeaderLabels([文件名, 文件大小, 修改日期, 权限, 所有者/组])
+    // 多层级目录树：目录节点首次展开时才请求子项，其他已展开分支保持可见。
+    // 双击由 onItemDoubleClicked 自己切换展开态，避免 Qt 默认行为重复切换。
     m_tree = new QTreeWidget(this);
     m_tree->setColumnCount(5);
     m_tree->setHeaderLabels({tr("文件名"), tr("文件大小"), tr("修改日期"),
                              tr("权限"), tr("所有者/组")});
-    m_tree->setRootIsDecorated(false);
-    m_tree->setIndentation(0);
+    m_tree->setRootIsDecorated(true);
+    m_tree->setIndentation(16);
+    m_tree->setExpandsOnDoubleClick(false);
     m_tree->setUniformRowHeights(true);
     m_tree->setSelectionMode(QTreeWidget::ExtendedSelection);
     // 列宽可拖动、总宽超出面板时出现水平滚动条。
@@ -251,6 +256,7 @@ SftpBrowserWidget::SftpBrowserWidget(QWidget *parent)
 
     connect(m_pathEdit, &QLineEdit::returnPressed, this, &SftpBrowserWidget::onPathEdited);
     connect(m_tree, &QTreeWidget::itemDoubleClicked, this, &SftpBrowserWidget::onItemDoubleClicked);
+    connect(m_tree, &QTreeWidget::itemExpanded, this, &SftpBrowserWidget::onItemExpanded);
     connect(m_tree->header(), &QHeaderView::sectionClicked,
             this, &SftpBrowserWidget::onHeaderSectionClicked);
 
@@ -573,7 +579,7 @@ void SftpBrowserWidget::resizeEvent(QResizeEvent *event)
         setStatusText(m_statusFullText);
 }
 
-void SftpBrowserWidget::loadPath(const QString &path, LoadReason reason)
+void SftpBrowserWidget::loadPath(const QString &path, LoadReason reason, bool preserveTree)
 {
     if (!m_sftp)
         return;
@@ -584,21 +590,21 @@ void SftpBrowserWidget::loadPath(const QString &path, LoadReason reason)
     setStatusText(tr("正在加载 %1 …").arg(path));
 
     // 陈旧响应防护：每次加载递增序号，回调只接受最新一次请求的结果，
-    // 防止快速连续双击时乱序返回的旧目录数据覆盖新目录。
+    // 防止快速连续切换根目录时乱序返回的旧数据覆盖新目录。
     const quint64 seq = ++m_loadSeq;
 
     // Fetch on a worker thread (listdirAttr is blocking under the session lock).
     SftpClient *sftp = m_sftp;
     const auto connection = m_shuttingDown;
     QPointer<SftpBrowserWidget> self(this);
-    QThread *worker = QThread::create([this, self, sftp, path, seq, reason, connection]() {
+    QThread *worker = QThread::create([this, self, sftp, path, seq, reason, preserveTree, connection]() {
         SshError err;
         const SftpFileInfoList entries = sftp->listdirAttr(path, err);
         const QString errMsg = err.message;
         if (connection->load() || !self)
             return;
         // 回主线程渲染（与 editSelected/decompressSelected 同款接线）。
-        QMetaObject::invokeMethod(self, [this, path, seq, reason, entries, errMsg, connection]() {
+        QMetaObject::invokeMethod(self, [this, path, seq, reason, preserveTree, entries, errMsg, connection]() {
             if (connection->load() || seq != m_loadSeq) // 换连接或已有更新的请求
                 return;
             if (entries.isEmpty() && !errMsg.isEmpty()) {
@@ -648,9 +654,10 @@ void SftpBrowserWidget::loadPath(const QString &path, LoadReason reason)
             // 同目录刷新（path == m_cwd）保留筛选，populate 会重应用。
             if (path != m_cwd && !m_filterEdit->text().isEmpty())
                 m_filterEdit->clear();
+            const bool preserveLoadedTree = preserveTree && path == m_cwd;
             m_cwd = path;
             m_pathEdit->setText(m_cwd);
-            populate(path, entries);
+            populate(path, entries, preserveLoadedTree);
             setStatusText(tr("%1 · %2 项").arg(path).arg(entries.size()));
         }, Qt::QueuedConnection);
     });
@@ -695,30 +702,70 @@ bool SftpBrowserWidget::blockedByUnavailable(const QString &title)
     return true;
 }
 
-// 渲染当前目录（平铺，首行为 ".." 返回上级）。
-// 对应Python: cube-shell.py::handle_file_tree_updated
-void SftpBrowserWidget::populate(const QString &path, const SftpFileInfoList &entries)
+// 渲染根目录。preserveTree=true 时按名称更新顶层条目，保留各目录已加载的
+// 子孙与展开状态；切换根目录则仍一次性替换整棵树，避免旧数据闪烁。
+void SftpBrowserWidget::populate(const QString &path, const SftpFileInfoList &entries,
+                                 bool preserveTree)
 {
     m_tree->setUpdatesEnabled(false);
-    m_tree->clear();
 
-    // ".." 返回上级目录条目（根目录除外）。对应Python: ls -al 里的 ".." 行
-    if (path != QLatin1String("/")) {
-        QString up = path.section(QLatin1Char('/'), 0, -2);
-        if (up.isEmpty())
-            up = QStringLiteral("/");
-        auto *upItem = new QTreeWidgetItem(m_tree);
-        upItem->setText(0, QStringLiteral(".."));
-        upItem->setIcon(0, iconForFile(QString(), true));
-        upItem->setData(0, kPathRole, up);
-        upItem->setData(0, kIsDirRole, true);
-        upItem->setData(0, kIsUpRole, true);
+    if (!preserveTree) {
+        m_tree->clear();
+        // ".." 只出现在树根，用于把整棵树切换到上级目录；展开树内节点不再
+        // 改变根目录，因此子目录里不需要重复的 ".." 行。
+        if (path != QLatin1String("/")) {
+            QString up = path.section(QLatin1Char('/'), 0, -2);
+            if (up.isEmpty())
+                up = QStringLiteral("/");
+            auto *upItem = new QTreeWidgetItem(m_tree);
+            upItem->setText(0, QStringLiteral(".."));
+            upItem->setIcon(0, iconForFile(QString(), true));
+            upItem->setData(0, kPathRole, up);
+            upItem->setData(0, kIsDirRole, true);
+            upItem->setData(0, kIsUpRole, true);
+        }
     }
 
-    // 按目录返回顺序插入，随后统一交给 sortFileTree 按当前排序列/序重排
-    // （替代原先的 std::sort 预排序：显示文本已格式化，排序必须比裸值）。
+    populateDirectory(nullptr, path, entries);
+    m_entryCount = int(entries.size());
+    // 排序与筛选跨刷新保持，递归应用到所有已经加载的目录。
+    sortFileTree(m_tree, m_sortColumn, m_sortOrder);
+    if (!m_filterEdit->text().trimmed().isEmpty())
+        applyFileFilter(m_tree, m_filterEdit->text());
+    // 成功列出目录 ⇒ 通道可用，恢复筛选入口（showUnavailableNotice 会禁掉它）。
+    m_filterBtn->setEnabled(true);
+    m_tree->setUpdatesEnabled(true);
+}
+
+// 填充某一层的直接子项。刷新时复用同名同类型节点，已加载子树不会被清掉；
+// 新目录先挂一个不可选占位子项，QTreeWidget 因而立即显示展开箭头。
+void SftpBrowserWidget::populateDirectory(QTreeWidgetItem *parent, const QString &path,
+                                          const SftpFileInfoList &entries)
+{
+    QHash<QString, QTreeWidgetItem *> existing;
+    const int oldCount = parent ? parent->childCount() : m_tree->topLevelItemCount();
+    for (int i = oldCount - 1; i >= 0; --i) {
+        QTreeWidgetItem *item = parent ? parent->child(i) : m_tree->topLevelItem(i);
+        if (item->data(0, kIsUpRole).toBool())
+            continue;
+        if (item->data(0, kIsPlaceholderRole).toBool()
+            || item->data(0, kPathRole).toString().isEmpty()) {
+            delete item;
+            continue;
+        }
+        existing.insert(item->text(0), item);
+    }
+
     for (const SftpFileInfo &e : entries) {
-        auto *item = new QTreeWidgetItem(m_tree);
+        QTreeWidgetItem *item = existing.take(e.filename);
+        if (item && item->data(0, kIsDirRole).toBool() != e.isDirectory()) {
+            delete item; // 远端条目换了类型，旧子树不能沿用
+            item = nullptr;
+        }
+        const bool isNew = !item;
+        if (!item)
+            item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(m_tree);
+
         const QString fullPath = joinPath(path, e.filename);
         item->setText(0, e.filename);
         // 目录也展示大小（4096 → "4.00 KB"），与 Python 侧 ls 一致
@@ -733,29 +780,135 @@ void SftpBrowserWidget::populate(const QString &path, const SftpFileInfoList &en
         // 排序用裸值：显示列是格式化文本，直接比字符串会把 "1 GB" 排到 "4.00 KB" 前。
         item->setData(0, kSizeRole, e.size);
         item->setData(0, kMtimeRole, e.mtime);
-        // 按扩展名映射类型图标（与本地浏览器共用 iconForFile）；
-        // 符号链接与可执行文件优先使用专用图标。
-        // 对应Python: handle_file_tree_updated 里根据 n[0] 权限位选图标
         item->setIcon(0, iconForFile(e.filename, e.isDirectory(), e.isSymlink(), e.mode));
+
+        if (e.isDirectory()) {
+            if (isNew)
+                item->setData(0, kChildrenStateRole, ChildrenNotLoaded);
+            const int state = item->data(0, kChildrenStateRole).toInt();
+            if (state != ChildrenLoaded && item->childCount() == 0) {
+                auto *placeholder = new QTreeWidgetItem(item);
+                placeholder->setText(0, tr("正在加载…"));
+                placeholder->setData(0, kIsPlaceholderRole, true);
+                placeholder->setFlags(Qt::NoItemFlags);
+            }
+        }
     }
+    // 远端已经不存在的条目连同其子树一起移除。
+    for (QTreeWidgetItem *item : std::as_const(existing))
+        delete item;
+}
 
-    m_entryCount = int(entries.size());
-    // 排序与筛选跨刷新保持：传输完成/手动刷新重载目录后视图状态不丢。
-    sortFileTree(m_tree, m_sortColumn, m_sortOrder);
-    if (!m_filterEdit->text().trimmed().isEmpty())
-        applyFileFilter(m_tree, m_filterEdit->text());
-    // 成功列出目录 ⇒ 通道可用，恢复筛选入口（showUnavailableNotice 会禁掉它）。
-    m_filterBtn->setEnabled(true);
+QTreeWidgetItem *SftpBrowserWidget::findDirectoryItem(const QString &path) const
+{
+    QTreeWidgetItemIterator it(m_tree);
+    while (*it) {
+        QTreeWidgetItem *item = *it;
+        if (!item->data(0, kIsUpRole).toBool()
+            && item->data(0, kIsDirRole).toBool()
+            && item->data(0, kPathRole).toString() == path)
+            return item;
+        ++it;
+    }
+    return nullptr;
+}
 
-    m_tree->setUpdatesEnabled(true);
+// 文件操作的目标目录：选中目录就是该目录，选中文件就是其父目录；
+// 空白或 ".." 仍回落到路径栏所示的树根目录。
+QString SftpBrowserWidget::currentDirectoryPath() const
+{
+    const QTreeWidgetItem *item = m_tree->currentItem();
+    if (!item || item->data(0, kIsUpRole).toBool())
+        return m_cwd;
+    const QString path = item->data(0, kPathRole).toString();
+    if (path.isEmpty())
+        return item->parent() ? item->parent()->data(0, kPathRole).toString() : m_cwd;
+    if (item->data(0, kIsDirRole).toBool())
+        return path;
+    QString parent = path.section(QLatin1Char('/'), 0, -2);
+    return parent.isEmpty() ? QStringLiteral("/") : parent;
+}
+
+// 展开目录的独立懒加载请求。不能复用根目录的“只接受最后一次请求”策略：
+// 树里允许同时有多个目录在加载，每个节点只淘汰自己的旧请求。
+void SftpBrowserWidget::loadChildren(QTreeWidgetItem *item, bool force)
+{
+    if (!item || !m_sftp || item->data(0, kIsUpRole).toBool()
+        || !item->data(0, kIsDirRole).toBool())
+        return;
+    const int oldState = item->data(0, kChildrenStateRole).toInt();
+    if (oldState == ChildrenLoading || (!force && oldState == ChildrenLoaded))
+        return;
+
+    const bool hadLoadedChildren = oldState == ChildrenLoaded;
+    const QString path = item->data(0, kPathRole).toString();
+    const quint64 seq = ++m_dirLoadSeq;
+    item->setData(0, kDirLoadSeqRole, seq);
+    item->setData(0, kChildrenStateRole, ChildrenLoading);
+    setStatusText(tr("正在加载 %1 …").arg(path));
+
+    SftpClient *sftp = m_sftp;
+    const auto connection = m_shuttingDown;
+    QPointer<SftpBrowserWidget> self(this);
+    QThread *worker = QThread::create([this, self, sftp, path, seq,
+                                       hadLoadedChildren, connection]() {
+        SshError err;
+        const SftpFileInfoList entries = sftp->listdirAttr(path, err);
+        const QString errMsg = err.message;
+        if (connection->load() || !self)
+            return;
+        QMetaObject::invokeMethod(self, [this, path, seq, hadLoadedChildren,
+                                         entries, errMsg, connection]() {
+            if (connection->load())
+                return;
+            // 不直接捕获 QTreeWidgetItem：刷新/换根可能已把它删除。结果回来后
+            // 按完整路径找当前节点，再核对节点上的请求序号。
+            QTreeWidgetItem *target = findDirectoryItem(path);
+            if (!target || target->data(0, kDirLoadSeqRole).toULongLong() != seq)
+                return;
+            target->setData(0, kDirLoadSeqRole, qulonglong(0));
+            if (entries.isEmpty() && !errMsg.isEmpty()) {
+                target->setData(0, kChildrenStateRole,
+                                hadLoadedChildren ? ChildrenLoaded : ChildrenNotLoaded);
+                if (!hadLoadedChildren)
+                    target->setExpanded(false); // 保留占位子项，下次展开可重试
+                setStatusText(tr("加载 %1 失败：%2").arg(path, errMsg));
+                return;
+            }
+            populateDirectory(target, path, entries);
+            target->setData(0, kChildrenStateRole, ChildrenLoaded);
+            sortFileTree(m_tree, m_sortColumn, m_sortOrder);
+            if (!m_filterEdit->text().trimmed().isEmpty())
+                applyFileFilter(m_tree, m_filterEdit->text());
+            setStatusText(tr("%1 · %2 项").arg(path).arg(entries.size()));
+        }, Qt::QueuedConnection);
+    });
+    startWorker(worker);
+}
+
+void SftpBrowserWidget::onItemExpanded(QTreeWidgetItem *item)
+{
+    if (item && item->data(0, kIsDirRole).toBool()
+        && item->data(0, kChildrenStateRole).toInt() == ChildrenNotLoaded)
+        loadChildren(item);
 }
 
 void SftpBrowserWidget::onItemDoubleClicked(QTreeWidgetItem *item, int)
 {
     if (!item)
         return;
-    if (item->data(0, kIsDirRole).toBool())
+    if (item->data(0, kIsUpRole).toBool()) {
         loadPath(item->data(0, kPathRole).toString());
+        return;
+    }
+    if (!item->data(0, kIsDirRole).toBool())
+        return;
+    m_tree->setCurrentItem(item);
+    const bool expand = !item->isExpanded();
+    item->setExpanded(expand); // itemExpanded 会在首次展开时启动懒加载
+    if (expand && item->data(0, kChildrenStateRole).toInt()
+            == ChildrenNotLoaded)
+        loadChildren(item);
 }
 
 void SftpBrowserWidget::goUp()
@@ -770,7 +923,17 @@ void SftpBrowserWidget::goUp()
 
 void SftpBrowserWidget::refresh()
 {
-    loadPath(m_cwd);
+    QTreeWidgetItem *item = m_tree->currentItem();
+    if (item && !item->data(0, kIsUpRole).toBool()) {
+        QTreeWidgetItem *directory = item->data(0, kIsDirRole).toBool()
+            ? item : item->parent();
+        if (directory) {
+            loadChildren(directory, true);
+            return;
+        }
+    }
+    // 当前项位于顶层：刷新树根，但保留已加载/展开的分支。
+    loadPath(m_cwd, LoadReason::UserRequested, true);
 }
 
 void SftpBrowserWidget::onPathEdited()
@@ -821,18 +984,25 @@ void SftpBrowserWidget::applyFilter()
         setStatusText(tr("%1 · %2 项").arg(m_cwd).arg(m_entryCount));
 }
 
-// 回车定位：选中第一个可见的普通条目（".." 与隐藏项跳过），并把焦点还给树，
-// 用户可直接用方向键在匹配结果间移动。
+// 回车定位：在所有已加载层级中选中第一个可见匹配项，展开其祖先并滚动到
+// 该节点；随后把焦点还给树，用户可直接用方向键继续移动。
 void SftpBrowserWidget::focusFirstFilterMatch()
 {
-    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
-        QTreeWidgetItem *item = m_tree->topLevelItem(i);
-        if (item->isHidden() || item->data(0, kIsUpRole).toBool())
-            continue;
-        m_tree->setCurrentItem(item);
-        m_tree->scrollToItem(item);
-        m_tree->setFocus();
-        return;
+    const QString needle = m_filterEdit->text().trimmed();
+    QTreeWidgetItemIterator it(m_tree);
+    while (*it) {
+        QTreeWidgetItem *item = *it;
+        if (!item->isHidden() && !item->data(0, kIsUpRole).toBool()
+            && !item->data(0, kIsPlaceholderRole).toBool()
+            && fileMatchesFilter(item->text(0), needle)) {
+            for (QTreeWidgetItem *p = item->parent(); p; p = p->parent())
+                p->setExpanded(true);
+            m_tree->setCurrentItem(item);
+            m_tree->scrollToItem(item);
+            m_tree->setFocus();
+            return;
+        }
+        ++it;
     }
 }
 
@@ -869,7 +1039,7 @@ void SftpBrowserWidget::mkdir()
                                                QLineEdit::Normal, QString(), &ok);
     if (!ok || name.trimmed().isEmpty())
         return;
-    const QString path = joinPath(m_cwd, name.trimmed());
+    const QString path = joinPath(currentDirectoryPath(), name.trimmed());
     SshError err;
     // Quick op; run directly (short under the lock).
     if (m_sftp->mkdir(path, 0755, &err))
@@ -884,6 +1054,18 @@ void SftpBrowserWidget::removeSelected()
     const QStringList paths = selectedRemotePaths();
     if (paths.isEmpty())
         return;
+    // 多选可能横跨多个已展开目录；删除后逐个刷新这些父目录，而不是刷新
+    // 可能已经消失的选中目录自身。
+    QStringList refreshPaths;
+    const QList<QTreeWidgetItem *> selectedItems = m_tree->selectedItems();
+    for (QTreeWidgetItem *item : selectedItems) {
+        if (item->data(0, kIsUpRole).toBool())
+            continue;
+        QTreeWidgetItem *parent = item->parent();
+        const QString parentPath = parent ? parent->data(0, kPathRole).toString() : m_cwd;
+        if (!refreshPaths.contains(parentPath))
+            refreshPaths.append(parentPath);
+    }
     // 单项沿用原文案（含完整路径），多项时给出数量与文件名清单。
     QString prompt;
     if (paths.size() == 1) {
@@ -916,9 +1098,16 @@ void SftpBrowserWidget::removeSelected()
         }
     });
     const auto connection = m_shuttingDown;
-    connect(worker, &QThread::finished, this, [this, connection]() {
-        if (!connection->load())
-            refresh();
+    connect(worker, &QThread::finished, this, [this, connection, refreshPaths]() {
+        if (connection->load())
+            return;
+        for (const QString &path : refreshPaths) {
+            if (path == m_cwd) {
+                loadPath(m_cwd, LoadReason::UserRequested, true);
+            } else if (QTreeWidgetItem *directory = findDirectoryItem(path)) {
+                loadChildren(directory, true);
+            }
+        }
     });
     startWorker(worker);
 }
@@ -962,8 +1151,9 @@ void SftpBrowserWidget::uploadFiles()
     if (blockedByUnavailable(tr("上传文件")))
         return;
     const QStringList files = QFileDialog::getOpenFileNames(this, tr("上传文件"));
+    const QString targetDir = currentDirectoryPath();
     for (const QString &local : files)
-        enqueueUpload(local, joinPath(m_cwd, QFileInfo(local).fileName()));
+        enqueueUpload(local, joinPath(targetDir, QFileInfo(local).fileName()));
     refreshUploadProgress();
 }
 
@@ -1063,9 +1253,18 @@ void SftpBrowserWidget::handleDropEvent(QDropEvent *event)
     }
 
     const QTreeWidgetItem *item = m_tree->itemAt(event->position().toPoint());
+    if (item && item->data(0, kIsPlaceholderRole).toBool())
+        item = item->parent(); // 加载提示行代表其父目录，不能误落到根目录
+    // 落到深层文件上时上传到它所在的目录，而不是路径栏所示的树根。
+    QString fallbackDir = m_cwd;
+    if (item && !item->data(0, kIsDirRole).toBool()) {
+        fallbackDir = item->data(0, kPathRole).toString().section(QLatin1Char('/'), 0, -2);
+        if (fallbackDir.isEmpty())
+            fallbackDir = QStringLiteral("/");
+    }
     const QString targetDir = item
         ? dropTargetDir(item->data(0, kPathRole).toString(),
-                        item->data(0, kIsDirRole).toBool(), m_cwd)
+                        item->data(0, kIsDirRole).toBool(), fallbackDir)
         : m_cwd;
 
     const QList<QPair<QString, QString>> tasks = collectUploadTasks(targetDir, localPaths);
@@ -1312,6 +1511,8 @@ void SftpBrowserWidget::showContextMenu(const QPoint &pos)
     // 点在已选中项上时用 NoUpdate 只移动 current、保留整个选区（与系统文件
     // 管理器一致）；点在未选中项上才重设选择为该项。
     QTreeWidgetItem *clicked = m_tree->itemAt(pos);
+    if (clicked && clicked->data(0, kIsPlaceholderRole).toBool())
+        return;
     if (clicked) {
         if (clicked->isSelected())
             m_tree->setCurrentItem(clicked, 0, QItemSelectionModel::NoUpdate);
@@ -1367,7 +1568,7 @@ void SftpBrowserWidget::createFileHere()
                                                QLineEdit::Normal, QString(), &ok);
     if (!ok || name.trimmed().isEmpty())
         return;
-    const QString path = joinPath(m_cwd, name.trimmed());
+    const QString path = joinPath(currentDirectoryPath(), name.trimmed());
     SshError err;
     if (m_sftp->writeFile(path, QByteArray(), err))
         refresh();
@@ -1416,9 +1617,15 @@ void SftpBrowserWidget::showPermissions()
         if (boxes[i]->isChecked())
             mode |= 1 << (8 - i);
     SshError err;
-    if (m_sftp->chmod(path, mode, &err))
-        refresh();
-    else
+    if (m_sftp->chmod(path, mode, &err)) {
+        // 权限列属于父目录中的该条目；刷新目录自身只会更新子项，更新不了它。
+        QTreeWidgetItem *parent = m_tree->currentItem()
+            ? m_tree->currentItem()->parent() : nullptr;
+        if (parent)
+            loadChildren(parent, true);
+        else
+            loadPath(m_cwd, LoadReason::UserRequested, true);
+    } else
         QMessageBox::warning(this, tr("权限设置"), err.message);
 }
 
@@ -1430,13 +1637,14 @@ void SftpBrowserWidget::decompressSelected()
     if (path.isEmpty() || !m_client)
         return;
 
+    const QString targetDir = currentDirectoryPath();
     QString cmd;
     if (path.endsWith(QLatin1String(".zip")))
-        cmd = QStringLiteral("unzip -o '%1' -d '%2'").arg(path, m_cwd);
+        cmd = QStringLiteral("unzip -o '%1' -d '%2'").arg(path, targetDir);
     else if (path.endsWith(QLatin1String(".tar.gz")) || path.endsWith(QLatin1String(".tgz")))
-        cmd = QStringLiteral("tar -xzvf '%1' -C '%2'").arg(path, m_cwd);
+        cmd = QStringLiteral("tar -xzvf '%1' -C '%2'").arg(path, targetDir);
     else if (path.endsWith(QLatin1String(".tar")))
-        cmd = QStringLiteral("tar -xvf '%1' -C '%2'").arg(path, m_cwd);
+        cmd = QStringLiteral("tar -xvf '%1' -C '%2'").arg(path, targetDir);
     else {
         QMessageBox::warning(this, tr("解压"),
                              tr("不支持的压缩格式：%1").arg(path.section(QLatin1Char('/'), -1)));
@@ -1503,9 +1711,15 @@ void SftpBrowserWidget::renameSelected()
         return;
     const QString dir = path.section(QLatin1Char('/'), 0, -2);
     SshError err;
-    if (m_sftp->rename(path, joinPath(dir.isEmpty() ? QStringLiteral("/") : dir, newName.trimmed()), &err))
-        refresh();
-    else
+    if (m_sftp->rename(path, joinPath(dir.isEmpty() ? QStringLiteral("/") : dir, newName.trimmed()), &err)) {
+        // 目录自身可能被重命名，不能再用旧路径刷新它；刷新其父目录。
+        QTreeWidgetItem *parent = m_tree->currentItem()
+            ? m_tree->currentItem()->parent() : nullptr;
+        if (parent)
+            loadChildren(parent, true);
+        else
+            loadPath(m_cwd, LoadReason::UserRequested, true);
+    } else
         QMessageBox::warning(this, tr("重命名"), err.message);
 }
 
@@ -1584,7 +1798,7 @@ void SftpBrowserWidget::compressSelected()
     if (dlg.exec() != QDialog::Accepted)
         return;
 
-    const QString dir = m_cwd;
+    const QString dir = currentDirectoryPath();
     QString cmd;
     if (dlg.format() == QLatin1String(".zip"))
         cmd = QStringLiteral("cd '%1' && zip -r '%2' '%3'").arg(dir, dlg.fileName(), baseName);

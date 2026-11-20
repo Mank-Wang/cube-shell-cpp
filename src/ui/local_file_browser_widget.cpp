@@ -15,6 +15,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -39,6 +40,7 @@
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
+#include <QTreeWidgetItemIterator>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -104,7 +106,7 @@ LocalFileBrowserWidget::LocalFileBrowserWidget(QWidget *parent)
     // 筛选开关：点击在路径栏下方弹出检索框，再次点击（或检索框里 Esc）收起。
     m_filterBtn = new QToolButton(this);
     m_filterBtn->setIcon(fileFilterIcon(palette()));
-    m_filterBtn->setToolTip(tr("筛选当前目录（Ctrl+F）"));
+    m_filterBtn->setToolTip(tr("筛选已加载的文件和目录（Ctrl+F）"));
     m_filterBtn->setCheckable(true);
     m_filterBtn->setAutoRaise(true);
 
@@ -116,25 +118,26 @@ LocalFileBrowserWidget::LocalFileBrowserWidget(QWidget *parent)
     pathLayout->addWidget(m_pathEdit, 1);
     pathLayout->addWidget(m_filterBtn);
 
-    // 检索框行（默认隐藏）：输入即筛选当前目录，Enter 定位第一个匹配项。
+    // 检索框行（默认隐藏）：输入即筛选所有已加载层级，Enter 定位第一个匹配项。
     m_filterBar = new QWidget(this);
     auto *filterLayout = new QHBoxLayout(m_filterBar);
     filterLayout->setContentsMargins(0, 2, 0, 2);
     filterLayout->setSpacing(4);
     m_filterEdit = new QLineEdit(m_filterBar);
-    m_filterEdit->setPlaceholderText(tr("输入关键字筛选当前目录，Enter 定位，Esc 关闭"));
+    m_filterEdit->setPlaceholderText(tr("筛选已加载的文件和目录，Enter 定位，Esc 关闭"));
     m_filterEdit->setClearButtonEnabled(true);
     filterLayout->addWidget(m_filterEdit, 1);
     m_filterBar->setVisible(false);
 
-    // 平铺列表（非展开树），五列表头与 SFTP 浏览器 / Python 侧一致。
-    // 对应Python: handle_file_tree_updated 里 setRootIsDecorated(False)/setIndentation(0)
+    // 与 SFTP 面板一致的多层级目录树：首次展开时读取子目录，双击由槽函数
+    // 自己切换展开态，避免 Qt 默认行为重复切换。
     m_tree = new QTreeWidget(this);
     m_tree->setColumnCount(5);
     m_tree->setHeaderLabels({tr("文件名"), tr("文件大小"), tr("修改日期"),
                              tr("权限"), tr("所有者/组")});
-    m_tree->setRootIsDecorated(false);
-    m_tree->setIndentation(0);
+    m_tree->setRootIsDecorated(true);
+    m_tree->setIndentation(16);
+    m_tree->setExpandsOnDoubleClick(false);
     m_tree->setUniformRowHeights(true);
     m_tree->setSelectionMode(QTreeWidget::ExtendedSelection);
     // 列宽可拖动、总宽超出面板时出现水平滚动条（与 SFTP 浏览器一致）。
@@ -166,6 +169,7 @@ LocalFileBrowserWidget::LocalFileBrowserWidget(QWidget *parent)
 
     connect(m_pathEdit, &QLineEdit::returnPressed, this, &LocalFileBrowserWidget::onPathEdited);
     connect(m_tree, &QTreeWidget::itemDoubleClicked, this, &LocalFileBrowserWidget::onItemDoubleClicked);
+    connect(m_tree, &QTreeWidget::itemExpanded, this, &LocalFileBrowserWidget::onItemExpanded);
     connect(m_tree->header(), &QHeaderView::sectionClicked,
             this, &LocalFileBrowserWidget::onHeaderSectionClicked);
 
@@ -194,13 +198,13 @@ void LocalFileBrowserWidget::setRootPath(const QString &path)
     const QString clean = QDir::cleanPath(path);
     if (clean.isEmpty() || !QFileInfo(clean).isDir())
         return;
-    // 换了目录就清掉旧筛选词（留在原样会让用户误以为新目录是空的）；
-    // 同目录刷新保留筛选，populate 会重应用。
-    if (clean != m_rootPath && !m_filterEdit->text().isEmpty())
+    // 同一路径的重复同步/刷新保留已展开分支；切换到新根目录才重建整棵树。
+    const bool preserveTree = clean == m_rootPath;
+    if (!preserveTree && !m_filterEdit->text().isEmpty())
         m_filterEdit->clear();
     m_rootPath = clean;
     m_pathEdit->setText(clean);
-    populate();
+    populate(preserveTree);
 }
 
 // 刷新路径栏左侧的分屏徽章。单分屏时隐藏，完整信息走 tooltip。
@@ -210,29 +214,61 @@ void LocalFileBrowserWidget::setPaneIndicator(int paneNumber, int totalPanes,
     updatePaneBadge(m_paneBadge, paneNumber, totalPanes, tabTitle);
 }
 
-// 渲染当前目录（平铺，首行为 ".." 返回上级）。
-// 对应Python: handle_file_tree_updated（本地分支复用同一渲染逻辑）
-void LocalFileBrowserWidget::populate()
+// 渲染树根。preserveTree=true 时更新顶层但保留各目录已加载的子孙与展开状态。
+void LocalFileBrowserWidget::populate(bool preserveTree)
 {
     m_tree->setUpdatesEnabled(false);
-    m_tree->clear();
 
-    // ".." 返回上级目录条目（根目录除外）。对应Python: ls -al 里的 ".." 行
-    QDir dir(m_rootPath);
-    if (!dir.isRoot()) {
-        auto *upItem = new QTreeWidgetItem(m_tree);
-        upItem->setText(0, QStringLiteral(".."));
-        upItem->setIcon(0, iconForFile(QString(), true));
-        upItem->setData(0, kIsDirRole, true);
-        upItem->setData(0, kIsUpRole, true);
+    if (!preserveTree) {
+        m_tree->clear();
+        // ".." 只用于切换整棵树的根目录；树内目录通过展开/收起浏览。
+        QDir dir(m_rootPath);
+        if (!dir.isRoot()) {
+            auto *upItem = new QTreeWidgetItem(m_tree);
+            upItem->setText(0, QStringLiteral(".."));
+            upItem->setIcon(0, iconForFile(QString(), true));
+            upItem->setData(0, kIsDirRole, true);
+            upItem->setData(0, kIsUpRole, true);
+        }
     }
 
-    // 按文件系统返回顺序插入，随后统一交给 sortFileTree 按当前排序列/序重排
-    // （替代原先的 std::sort 预排序：显示文本已格式化，排序必须比裸值）。
+    populateDirectory(nullptr, m_rootPath);
+    sortFileTree(m_tree, m_sortColumn, m_sortOrder);
+    if (!m_filterEdit->text().trimmed().isEmpty())
+        applyFileFilter(m_tree, m_filterEdit->text());
+    m_tree->setUpdatesEnabled(true);
+}
+
+// 填充某一层直接子项。与 SFTP 相同：刷新复用同名同类型节点，新目录先挂
+// 一个占位项以显示展开箭头，真正的子项到首次展开时才读取。
+void LocalFileBrowserWidget::populateDirectory(QTreeWidgetItem *parent, const QString &path)
+{
+    QHash<QString, QTreeWidgetItem *> existing;
+    const int oldCount = parent ? parent->childCount() : m_tree->topLevelItemCount();
+    for (int i = oldCount - 1; i >= 0; --i) {
+        QTreeWidgetItem *item = parent ? parent->child(i) : m_tree->topLevelItem(i);
+        if (item->data(0, kIsUpRole).toBool())
+            continue;
+        if (item->data(0, kIsPlaceholderRole).toBool()
+            || item->data(0, kPathRole).toString().isEmpty()) {
+            delete item;
+            continue;
+        }
+        existing.insert(item->text(0), item);
+    }
+
     const QFileInfoList entries =
-        dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden);
+        QDir(path).entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden);
     for (const QFileInfo &fi : entries) {
-        auto *item = new QTreeWidgetItem(m_tree);
+        QTreeWidgetItem *item = existing.take(fi.fileName());
+        if (item && item->data(0, kIsDirRole).toBool() != fi.isDir()) {
+            delete item;
+            item = nullptr;
+        }
+        const bool isNew = !item;
+        if (!item)
+            item = parent ? new QTreeWidgetItem(parent) : new QTreeWidgetItem(m_tree);
+
         item->setText(0, fi.fileName());
         item->setText(1, formatFileSize(fi.size()));
         item->setText(2, fi.lastModified().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
@@ -240,20 +276,83 @@ void LocalFileBrowserWidget::populate()
         item->setText(4, ownerText(fi));
         item->setData(0, kPathRole, fi.absoluteFilePath());
         item->setData(0, kIsDirRole, fi.isDir());
-        // 排序用裸值：显示列是格式化文本，直接比字符串会把 "1 GB" 排到 "4.00 KB" 前。
         item->setData(0, kSizeRole, fi.size());
         item->setData(0, kMtimeRole, fi.lastModified().toSecsSinceEpoch());
-        // 按扩展名映射类型图标（与 Python 版共用同一套映射）。
-        // 对应Python: item.setIcon(0, util.get_default_file_icon(n[8]))
         item->setIcon(0, iconForFile(fi.fileName(), fi.isDir()));
-    }
 
-    // 排序与筛选跨刷新保持（与 SFTP 面板一致）。
+        if (fi.isDir()) {
+            if (isNew)
+                item->setData(0, kChildrenStateRole, ChildrenNotLoaded);
+            const int state = item->data(0, kChildrenStateRole).toInt();
+            if (state != ChildrenLoaded && item->childCount() == 0) {
+                auto *placeholder = new QTreeWidgetItem(item);
+                placeholder->setText(0, tr("正在加载…"));
+                placeholder->setData(0, kIsPlaceholderRole, true);
+                placeholder->setFlags(Qt::NoItemFlags);
+            }
+        }
+    }
+    for (QTreeWidgetItem *item : std::as_const(existing))
+        delete item;
+}
+
+void LocalFileBrowserWidget::loadChildren(QTreeWidgetItem *item, bool force)
+{
+    if (!item || item->data(0, kIsUpRole).toBool()
+        || !item->data(0, kIsDirRole).toBool())
+        return;
+    const int oldState = item->data(0, kChildrenStateRole).toInt();
+    if (oldState == ChildrenLoading || (!force && oldState == ChildrenLoaded))
+        return;
+    item->setData(0, kChildrenStateRole, ChildrenLoading);
+    populateDirectory(item, item->data(0, kPathRole).toString());
+    item->setData(0, kChildrenStateRole, ChildrenLoaded);
     sortFileTree(m_tree, m_sortColumn, m_sortOrder);
     if (!m_filterEdit->text().trimmed().isEmpty())
         applyFileFilter(m_tree, m_filterEdit->text());
+}
 
-    m_tree->setUpdatesEnabled(true);
+// 文件操作目标：选中目录就是该目录，选中文件就是其父目录，空白回落到树根。
+QString LocalFileBrowserWidget::currentDirectoryPath() const
+{
+    const QTreeWidgetItem *item = m_tree->currentItem();
+    if (!item || item->data(0, kIsUpRole).toBool())
+        return m_rootPath;
+    const QString path = item->data(0, kPathRole).toString();
+    if (path.isEmpty())
+        return item->parent() ? item->parent()->data(0, kPathRole).toString() : m_rootPath;
+    return item->data(0, kIsDirRole).toBool() ? path : QFileInfo(path).absolutePath();
+}
+
+void LocalFileBrowserWidget::refreshDirectory(const QString &path)
+{
+    if (path == m_rootPath) {
+        populate(true);
+        return;
+    }
+    QTreeWidgetItemIterator it(m_tree);
+    while (*it) {
+        QTreeWidgetItem *item = *it;
+        if (!item->data(0, kIsUpRole).toBool()
+            && item->data(0, kIsDirRole).toBool()
+            && item->data(0, kPathRole).toString() == path) {
+            loadChildren(item, true);
+            return;
+        }
+        ++it;
+    }
+}
+
+void LocalFileBrowserWidget::refreshParents(const QStringList &paths)
+{
+    QStringList parents;
+    for (const QString &path : paths) {
+        const QString parent = QFileInfo(path).absolutePath();
+        if (!parents.contains(parent))
+            parents.append(parent);
+    }
+    for (const QString &parent : std::as_const(parents))
+        refreshDirectory(parent);
 }
 
 void LocalFileBrowserWidget::goUp()
@@ -312,18 +411,24 @@ void LocalFileBrowserWidget::applyFilter()
     applyFileFilter(m_tree, m_filterEdit->text());
 }
 
-// 回车定位：选中第一个可见的普通条目（".." 与隐藏项跳过），并把焦点还给树，
-// 用户可直接用方向键在匹配结果间移动。
+// 回车定位所有已加载层级中的首个匹配项，展开其祖先并滚动到该节点。
 void LocalFileBrowserWidget::focusFirstFilterMatch()
 {
-    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
-        QTreeWidgetItem *item = m_tree->topLevelItem(i);
-        if (item->isHidden() || item->data(0, kIsUpRole).toBool())
-            continue;
-        m_tree->setCurrentItem(item);
-        m_tree->scrollToItem(item);
-        m_tree->setFocus();
-        return;
+    const QString needle = m_filterEdit->text().trimmed();
+    QTreeWidgetItemIterator it(m_tree);
+    while (*it) {
+        QTreeWidgetItem *item = *it;
+        if (!item->isHidden() && !item->data(0, kIsUpRole).toBool()
+            && !item->data(0, kIsPlaceholderRole).toBool()
+            && fileMatchesFilter(item->text(0), needle)) {
+            for (QTreeWidgetItem *p = item->parent(); p; p = p->parent())
+                p->setExpanded(true);
+            m_tree->setCurrentItem(item);
+            m_tree->scrollToItem(item);
+            m_tree->setFocus();
+            return;
+        }
+        ++it;
     }
 }
 
@@ -340,19 +445,33 @@ bool LocalFileBrowserWidget::eventFilter(QObject *obj, QEvent *event)
     return QWidget::eventFilter(obj, event);
 }
 
+void LocalFileBrowserWidget::onItemExpanded(QTreeWidgetItem *item)
+{
+    if (item && item->data(0, kIsDirRole).toBool()
+        && item->data(0, kChildrenStateRole).toInt() == ChildrenNotLoaded)
+        loadChildren(item);
+}
+
 void LocalFileBrowserWidget::onItemDoubleClicked(QTreeWidgetItem *item, int)
 {
-    if (!item || !item->data(0, kIsDirRole).toBool())
+    if (!item)
         return;
-    if (item->data(0, kIsUpRole).toBool())
+    if (item->data(0, kIsUpRole).toBool()) {
         goUp();
-    else
-        setRootPath(item->data(0, kPathRole).toString());
+        return;
+    }
+    if (!item->data(0, kIsDirRole).toBool())
+        return;
+    m_tree->setCurrentItem(item);
+    const bool expand = !item->isExpanded();
+    item->setExpanded(expand);
+    if (expand && item->data(0, kChildrenStateRole).toInt() == ChildrenNotLoaded)
+        loadChildren(item);
 }
 
 void LocalFileBrowserWidget::refresh()
 {
-    populate();
+    refreshDirectory(currentDirectoryPath());
 }
 
 QString LocalFileBrowserWidget::selectedPath() const
@@ -388,6 +507,8 @@ void LocalFileBrowserWidget::showContextMenu(const QPoint &pos)
     // 点在已选中项上时用 NoUpdate 只移动 current、保留整个选区（与系统文件
     // 管理器一致）；点在未选中项上才重设选择为该项。
     if (QTreeWidgetItem *item = m_tree->itemAt(pos)) {
+        if (item->data(0, kIsPlaceholderRole).toBool())
+            return;
         if (item->isSelected())
             m_tree->setCurrentItem(item, 0, QItemSelectionModel::NoUpdate);
         else
@@ -476,13 +597,14 @@ void LocalFileBrowserWidget::uploadFiles()
     if (files.isEmpty())
         return;
     QStringList failed;
+    const QString targetDir = currentDirectoryPath();
     for (const QString &src : files) {
-        const QString dst = m_rootPath + QLatin1Char('/') + QFileInfo(src).fileName();
+        const QString dst = targetDir + QLatin1Char('/') + QFileInfo(src).fileName();
         QFile::remove(dst);
         if (!QFile::copy(src, dst))
             failed.append(QFileInfo(src).fileName());
     }
-    populate();
+    refreshDirectory(targetDir);
     if (!failed.isEmpty())
         QMessageBox::warning(this, tr("上传文件"),
                              tr("上传失败：%1").arg(failed.join(QStringLiteral(", "))));
@@ -520,7 +642,7 @@ void LocalFileBrowserWidget::editSelected()
             QMessageBox::warning(this, tr("编辑文本"), tr("保存失败：%1").arg(path));
             return;
         }
-        populate();
+        refreshDirectory(QFileInfo(path).absolutePath());
     });
     editor->show();
 }
@@ -533,13 +655,14 @@ void LocalFileBrowserWidget::createDirHere()
                                                QLineEdit::Normal, QString(), &ok);
     if (!ok || name.trimmed().isEmpty())
         return;
-    QDir dir(m_rootPath);
+    const QString targetDir = currentDirectoryPath();
+    QDir dir(targetDir);
     if (dir.exists(name.trimmed())) {
         QMessageBox::warning(this, tr("创建文件夹"), tr("文件夹已存在"));
         return;
     }
     if (dir.mkdir(name.trimmed()))
-        populate();
+        refreshDirectory(targetDir);
     else
         QMessageBox::warning(this, tr("创建文件夹"), tr("当前文件夹权限不足，请设置权限之后再操作"));
 }
@@ -552,26 +675,23 @@ void LocalFileBrowserWidget::createFileHere()
                                                QLineEdit::Normal, QString(), &ok);
     if (!ok || name.trimmed().isEmpty())
         return;
-    QFile f(m_rootPath + QLatin1Char('/') + name.trimmed());
+    const QString targetDir = currentDirectoryPath();
+    QFile f(targetDir + QLatin1Char('/') + name.trimmed());
     if (f.open(QIODevice::WriteOnly)) {   // 与 Python 'w' 一致：存在则清空
         f.close();
-        populate();
+        refreshDirectory(targetDir);
     } else {
         QMessageBox::warning(this, tr("创建文件"), tr("当前文件夹权限不足，请设置权限之后再操作"));
     }
 }
 
 #ifdef CUBESHELL_WITH_LOCALPTY
-// 选中目录则在该目录、否则在当前目录新开本机终端（由外层接线）。
+// 选中目录则在该目录、选中文件则在其父目录新开本机终端（由外层接线）。
 // 对应Python: open_local_terminal_in_selected_folder
 // 鸿蒙：无本地 shell，菜单入口已摘除，本槽不编译。
 void LocalFileBrowserWidget::openTerminalHere()
 {
-    QString target = m_rootPath;
-    const QString sel = selectedPath();
-    if (!sel.isEmpty() && QFileInfo(sel).isDir())
-        target = sel;
-    emit newTerminalRequested(target);
+    emit newTerminalRequested(currentDirectoryPath());
 }
 #endif // CUBESHELL_WITH_LOCALPTY
 
@@ -648,7 +768,7 @@ void LocalFileBrowserWidget::showPermissions()
         if (boxes[i]->isChecked())
             next |= bits[i];
     if (QFile::setPermissions(path, next))
-        populate();
+        refreshParents({path});
     else
         QMessageBox::warning(this, tr("权限设置"), tr("设置权限失败：%1").arg(path));
 }
@@ -673,7 +793,7 @@ void LocalFileBrowserWidget::removeSelected()
         if (!ok)
             failed.append(fi.fileName());
     }
-    populate();
+    refreshParents(paths);
     if (!failed.isEmpty())
         QMessageBox::warning(this, tr("删除"),
                              tr("删除失败：%1").arg(failed.join(QStringLiteral(", "))));
@@ -695,7 +815,7 @@ void LocalFileBrowserWidget::renameSelected()
         if (!QFile::rename(p, dst))
             QMessageBox::warning(this, tr("重命名"), tr("重命名失败：%1").arg(oldName));
     }
-    populate();
+    refreshParents(paths);
 }
 
 #ifndef CUBESHELL_PLATFORM_OHOS
@@ -708,14 +828,15 @@ void LocalFileBrowserWidget::decompressSelected()
     if (paths.isEmpty())
         return;
 
+    const QString targetDir = currentDirectoryPath();
     QList<QPair<QString, QStringList>> cmds;   // program + args
     for (const QString &p : paths) {
         if (p.endsWith(QLatin1String(".zip")))
-            cmds.append({QStringLiteral("unzip"), {QStringLiteral("-o"), p, QStringLiteral("-d"), m_rootPath}});
+            cmds.append({QStringLiteral("unzip"), {QStringLiteral("-o"), p, QStringLiteral("-d"), targetDir}});
         else if (p.endsWith(QLatin1String(".tar.gz")) || p.endsWith(QLatin1String(".tgz")))
-            cmds.append({QStringLiteral("tar"), {QStringLiteral("-xzf"), p, QStringLiteral("-C"), m_rootPath}});
+            cmds.append({QStringLiteral("tar"), {QStringLiteral("-xzf"), p, QStringLiteral("-C"), targetDir}});
         else if (p.endsWith(QLatin1String(".tar")))
-            cmds.append({QStringLiteral("tar"), {QStringLiteral("-xf"), p, QStringLiteral("-C"), m_rootPath}});
+            cmds.append({QStringLiteral("tar"), {QStringLiteral("-xf"), p, QStringLiteral("-C"), targetDir}});
         else {
             QMessageBox::warning(this, tr("解压"),
                                  tr("不支持的压缩格式：%1").arg(QFileInfo(p).fileName()));
@@ -723,7 +844,7 @@ void LocalFileBrowserWidget::decompressSelected()
         }
     }
 
-    QThread *worker = QThread::create([this, cmds]() {
+    QThread *worker = QThread::create([this, cmds, targetDir]() {
         QString errMsg;
         for (const auto &c : cmds) {
             QProcess proc;
@@ -735,9 +856,9 @@ void LocalFileBrowserWidget::decompressSelected()
                 break;
             }
         }
-        QMetaObject::invokeMethod(this, [this, errMsg]() {
+        QMetaObject::invokeMethod(this, [this, errMsg, targetDir]() {
             if (errMsg.isEmpty())
-                populate();
+                refreshDirectory(targetDir);
             else
                 QMessageBox::warning(this, tr("解压失败"), errMsg);
         }, Qt::QueuedConnection);
@@ -785,7 +906,7 @@ void LocalFileBrowserWidget::compressSelected()
         args << QStringLiteral("-czf") << dlg.fileName() << relNames;
     }
 
-    const QString workDir = m_rootPath;
+    const QString workDir = currentDirectoryPath();
     QThread *worker = QThread::create([this, program, args, workDir]() {
         QProcess proc;
         proc.setWorkingDirectory(workDir);
@@ -796,9 +917,9 @@ void LocalFileBrowserWidget::compressSelected()
             if (errMsg.isEmpty())
                 errMsg = tr("命令执行失败：%1").arg(program);
         }
-        QMetaObject::invokeMethod(this, [this, errMsg]() {
+        QMetaObject::invokeMethod(this, [this, errMsg, workDir]() {
             if (errMsg.isEmpty())
-                populate();
+                refreshDirectory(workDir);
             else
                 QMessageBox::warning(this, tr("压缩失败"), errMsg);
         }, Qt::QueuedConnection);

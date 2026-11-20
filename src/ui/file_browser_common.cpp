@@ -1,13 +1,16 @@
 #include "file_browser_common.h"
 
+#include <QItemSelectionModel>
 #include <QPainter>
 #include <QPalette>
 #include <QPixmap>
 #include <QString>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
+#include <QTreeWidgetItemIterator>
 
 #include <algorithm>
+#include <functional>
 
 namespace cubeshell {
 
@@ -23,14 +26,33 @@ int applyFileFilter(QTreeWidget *tree, const QString &needle)
     if (!tree)
         return 0;
     const QString n = needle.trimmed();
+    // 返回值：该子树里名称自身匹配的条目数。父目录即使自身不匹配，只要
+    // 后代有命中也保持可见，否则多层级树会把命中项连同祖先一起藏掉。
+    const std::function<int(QTreeWidgetItem *)> applyToItem =
+        [&](QTreeWidgetItem *item) -> int {
+        const bool isUp = item->data(0, kIsUpRole).toBool();
+        const bool isPlaceholder = item->data(0, kIsPlaceholderRole).toBool();
+        int childMatches = 0;
+        for (int i = 0; i < item->childCount(); ++i)
+            childMatches += applyToItem(item->child(i));
+        const bool isEntry = !isUp && !isPlaceholder;
+        const bool selfMatch = isEntry && fileMatchesFilter(item->text(0), n);
+        const bool show = n.isEmpty() || selfMatch || childMatches > 0;
+        item->setHidden(!show);
+        const int ownCount = n.isEmpty() ? int(isEntry) : int(selfMatch);
+        return ownCount + childMatches;
+    };
     int visible = 0;
     for (int i = 0; i < tree->topLevelItemCount(); ++i) {
         QTreeWidgetItem *item = tree->topLevelItem(i);
         const bool isUp = item->data(0, kIsUpRole).toBool();
-        const bool show = n.isEmpty() || (!isUp && fileMatchesFilter(item->text(0), n));
-        item->setHidden(!show);
-        if (show && !isUp)
-            ++visible;
+        const int matches = applyToItem(item);
+        if (n.isEmpty() && isUp)
+            item->setHidden(false);
+        else if (!n.isEmpty() && isUp)
+            item->setHidden(true);
+        if (!isUp)
+            visible += matches;
     }
     return visible;
 }
@@ -99,20 +121,55 @@ void sortFileTree(QTreeWidget *tree, int column, Qt::SortOrder order)
 {
     if (!tree)
         return;
-    // 先摘出全部顶层条目：".." 单列（恒置顶），其余参与排序。
-    QList<QTreeWidgetItem *> ups, rest;
-    while (tree->topLevelItemCount() > 0) {
-        QTreeWidgetItem *item = tree->takeTopLevelItem(0);
-        (item->data(0, kIsUpRole).toBool() ? ups : rest).append(item);
+    // take/add 会让视图丢失展开和选中状态；节点本身不销毁，先记下指针，
+    // 排序结束后统一恢复。
+    QList<QTreeWidgetItem *> expandedItems, selectedItems;
+    QTreeWidgetItem *currentItem = tree->currentItem();
+    QTreeWidgetItemIterator it(tree);
+    while (*it) {
+        if ((*it)->isExpanded())
+            expandedItems.append(*it);
+        if ((*it)->isSelected())
+            selectedItems.append(*it);
+        ++it;
     }
-    std::stable_sort(rest.begin(), rest.end(),
-                     [column, order](const QTreeWidgetItem *x, const QTreeWidgetItem *y) {
-                         return fileTreeSortLess(column, order, sortKeyOf(x), sortKeyOf(y));
-                     });
-    for (QTreeWidgetItem *item : std::as_const(ups))
-        tree->addTopLevelItem(item);
-    for (QTreeWidgetItem *item : std::as_const(rest))
-        tree->addTopLevelItem(item);
+
+    // 每组兄弟节点独立排序，不能把不同目录的条目混在一起。take/add 只改变
+    // 顺序，不销毁节点，因此已加载子树保留。
+    const std::function<void(QTreeWidgetItem *)> sortLevel =
+        [&](QTreeWidgetItem *parent) {
+        QList<QTreeWidgetItem *> ups, rest;
+        const auto takeAt = [&](int index) -> QTreeWidgetItem * {
+            return parent ? parent->takeChild(index) : tree->takeTopLevelItem(index);
+        };
+        const auto add = [&](QTreeWidgetItem *item) {
+            if (parent)
+                parent->addChild(item);
+            else
+                tree->addTopLevelItem(item);
+        };
+        while ((parent ? parent->childCount() : tree->topLevelItemCount()) > 0) {
+            QTreeWidgetItem *item = takeAt(0);
+            (item->data(0, kIsUpRole).toBool() ? ups : rest).append(item);
+        }
+        std::stable_sort(rest.begin(), rest.end(),
+                         [column, order](const QTreeWidgetItem *x, const QTreeWidgetItem *y) {
+                             return fileTreeSortLess(column, order, sortKeyOf(x), sortKeyOf(y));
+                         });
+        for (QTreeWidgetItem *item : std::as_const(ups))
+            add(item);
+        for (QTreeWidgetItem *item : std::as_const(rest)) {
+            add(item);
+            sortLevel(item);
+        }
+    };
+    sortLevel(nullptr);
+    for (QTreeWidgetItem *item : std::as_const(expandedItems))
+        item->setExpanded(true);
+    for (QTreeWidgetItem *item : std::as_const(selectedItems))
+        item->setSelected(true);
+    if (currentItem)
+        tree->setCurrentItem(currentItem, 0, QItemSelectionModel::NoUpdate);
 }
 
 // ---- 筛选按钮图标 ---------------------------------------------------------
