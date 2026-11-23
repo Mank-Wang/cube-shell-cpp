@@ -3140,17 +3140,15 @@ void MainWindow::openSshSessionWithCommand(const DeviceEntry &stub, const QStrin
         updateLeftPanel();
         updateTerminalInfo();
     });
-    // OSC7 cwd 报告：首个即远程 home，作为文件树初始目录；
-    // 之后仅在勾选“跟随终端目录”时联动。
+    // 初始目录由 SFTP 自行解析；OSC7 只记录终端 cwd，并在勾选跟随时同步。
+    // 不能让首个上报无条件覆盖已加载的目录，否则会触发第二次初始化。
     // 对应Python: _on_cwd_changed（follow_folder → refreshDirs）
     connect(tab, &SshSessionTab::cwdChanged, this, [this, tab](const QString &path) {
         SftpBrowserWidget *browser = tab->sftpBrowser();
         if (!browser)
             return;
-        const bool first = !browser->property("cwdSeen").toBool();
-        browser->setProperty("cwdSeen", true);
         browser->setProperty("lastCwd", path);
-        if (first || m_deviceList->followFolderEnabled())
+        if (m_deviceList->followFolderEnabled())
             browser->setCurrentPath(path);
     });
     connect(tab, &SshSessionTab::connectionFailed, this, [this, tab](const QString &msg) {

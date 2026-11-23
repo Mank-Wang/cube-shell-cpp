@@ -44,7 +44,7 @@ SshSessionTab::SshSessionTab(const DeviceEntry &device, QWidget *parent)
 
     // Relay signals.
     connect(m_term, &SshTerminalWidget::connected, this, [this]() {
-        // 挂接 SFTP（初始目录：OSC7 首个 cwd 或 "/"，见 MainWindow 侧接线）。
+        // 挂接 SFTP：首次由 SFTP 解析登录用户目录，重连恢复当前浏览目录。
         // 传 shared_ptr：让 SftpBrowserWidget 共享 SshClient 所有权，保证应用关闭
         // 时 client 比 SftpClient 后析构（m_monitor 的注释同此约定）。
         if (m_term->sshClient())

@@ -1,11 +1,13 @@
 // SFTP 面板换 SSH 连接的回归：旧组件/旧回调不能跨连接复用。
 // 默认离屏、无网络；--integration 使用 CUBESSH_HOST/PORT/USER/PASS 的测试 sshd。
 
+#include <QAbstractItemModel>
 #include <QApplication>
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPointer>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -55,6 +57,43 @@ static QTreeWidgetItem *findEntry(SftpBrowserWidget &browser, const QString &nam
         ++it;
     }
     return nullptr;
+}
+
+static void testInitialPathIsUnknown()
+{
+    SftpBrowserWidget browser;
+    auto *pathEdit = browser.findChild<QLineEdit *>();
+    CHECK(pathEdit);
+    if (!pathEdit)
+        return;
+    CHECK(browser.currentPath().isEmpty());
+    CHECK(pathEdit->text().isEmpty());
+    auto *tree = browser.findChild<QTreeWidget *>();
+    CHECK(tree && !tree->isEnabled());
+
+    QStringList displayedPaths;
+    QObject::connect(pathEdit, &QLineEdit::textChanged, &browser,
+                     [&displayedPaths](const QString &path) { displayedPaths.append(path); });
+    browser.setClient(std::make_shared<SshClient>());
+    CHECK(!statusText(browser).contains(QStringLiteral("正在加载 /")));
+    CHECK(waitUntil([&]() { return statusText(browser).contains(QStringLiteral("无法")); }));
+    CHECK(browser.currentPath().isEmpty());
+    CHECK(pathEdit->text().isEmpty());
+    CHECK(!displayedPaths.contains(QStringLiteral("/")));
+
+    // 初始化失败后仍可重试，不能悄悄退回根目录。
+    CHECK(QMetaObject::invokeMethod(&browser, "refresh", Qt::DirectConnection));
+    CHECK(waitUntil([&]() { return statusText(browser).contains(QStringLiteral("无法")); }));
+    CHECK(browser.currentPath().isEmpty());
+    CHECK(!displayedPaths.contains(QStringLiteral("/")));
+
+    // 真正指定根目录时必须区别于“初始目录未知”，并在绑定连接后加载它。
+    browser.setClient(nullptr);
+    browser.setCurrentPath(QStringLiteral("/"));
+    browser.setClient(std::make_shared<SshClient>());
+    CHECK(browser.currentPath() == QStringLiteral("/"));
+    CHECK(pathEdit->text() == QStringLiteral("/"));
+    CHECK(statusText(browser).contains(QStringLiteral("正在加载 /")));
 }
 
 static void testReplaceClient()
@@ -133,6 +172,9 @@ static void testTeardownStopsNewOperations()
     CHECK(!sftp.open(error));
     CHECK(error.message.contains(QStringLiteral("closing")));
     error = {};
+    CHECK(sftp.realpath(QStringLiteral("."), error).isEmpty());
+    CHECK(error.message.contains(QStringLiteral("closing")));
+    error = {};
     CHECK(sftp.listdirAttr(QStringLiteral("/"), error).isEmpty());
     CHECK(error.message.contains(QStringLiteral("closing")));
 }
@@ -151,6 +193,63 @@ static std::shared_ptr<SshClient> connectClient()
         return {};
     }
     return client;
+}
+
+static int testLiveInitialDirectory(bool syncWhileLoading)
+{
+    auto client = connectClient();
+    if (!client)
+        return 2;
+    QString expectedHome;
+    {
+        SftpClient reference(client.get());
+        SshError error;
+        expectedHome = reference.realpath(QStringLiteral("."), error);
+        CHECK(error.message.isEmpty());
+        CHECK(expectedHome.startsWith(QLatin1Char('/')));
+        const QString configuredHome = qEnvironmentVariable("CUBESSH_HOME");
+        if (!configuredHome.isEmpty())
+            CHECK(expectedHome == configuredHome);
+    }
+    if (expectedHome.isEmpty())
+        return 1;
+
+    // 不启动 shell，也没有 OSC7；初始目录必须由 SFTP 自己解析。
+    SftpBrowserWidget browser;
+    auto *pathEdit = browser.findChild<QLineEdit *>();
+    auto *tree = browser.findChild<QTreeWidget *>();
+    CHECK(pathEdit && tree);
+    if (!pathEdit || !tree)
+        return 1;
+    CHECK(pathEdit->text().isEmpty());
+    QStringList displayedPaths, renderedPaths;
+    QObject::connect(pathEdit, &QLineEdit::textChanged, &browser,
+                     [&](const QString &path) { displayedPaths.append(path); });
+    QObject::connect(tree->model(), &QAbstractItemModel::rowsInserted, &browser,
+                     [&](const QModelIndex &parent, int, int) {
+        if (!parent.isValid())
+            renderedPaths.append(browser.currentPath());
+    });
+    browser.setClient(client);
+    if (syncWhileLoading)
+        browser.setCurrentPath(expectedHome); // 模拟启用跟随时先收到目录上报
+    CHECK(waitUntil([&]() { return statusText(browser).contains(QStringLiteral("项")); }));
+    CHECK(browser.currentPath() == expectedHome);
+    CHECK(pathEdit->text() == expectedHome);
+    CHECK(displayedPaths == QStringList{expectedHome});
+    CHECK(tree->isEnabled());
+    for (const QString &path : renderedPaths)
+        CHECK(path == expectedHome);
+
+    // 首个/重复 OSC7 晚于首次展示到达，也不能重新加载相同的目录。
+    const QString loadedStatus = statusText(browser);
+    browser.setCurrentPath(expectedHome);
+    QCoreApplication::processEvents();
+    CHECK(statusText(browser) == loadedStatus);
+    CHECK(displayedPaths == QStringList{expectedHome});
+    browser.setClient(nullptr);
+    qInfo() << "initial SFTP directory:" << expectedHome << failures << "failure(s)";
+    return failures ? 1 : 0;
 }
 
 static int testLiveReconnect()
@@ -255,8 +354,11 @@ int main(int argc, char **argv)
     QTemporaryDir home;
     qputenv("HOME", home.path().toUtf8());
     QApplication app(argc, argv);
+    if (app.arguments().contains(QStringLiteral("--initial-directory")))
+        return testLiveInitialDirectory(app.arguments().contains(QStringLiteral("--sync-while-loading")));
     if (app.arguments().contains(QStringLiteral("--integration")))
         return testLiveReconnect();
+    testInitialPathIsUnknown();
     testReplaceClient();
     testStaleCallbacks();
     testTeardownStopsNewOperations();

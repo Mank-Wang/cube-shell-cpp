@@ -99,6 +99,10 @@ public:
     // --- synchronous metadata / directory operations (caller serializes via
     // the UI or a worker thread; the libssh2 lock is taken internally) ---
 
+    // Resolve a server-side path. "." identifies the SFTP login directory,
+    // including custom homes and chroot namespaces. Empty on error.
+    QString realpath(const QString &path, SshError &error);
+
     // Names only (paramiko listdir). Returns entry names, no "." / "..".
     QStringList listdir(const QString &path, SshError &error);
     // Full attributes (paramiko listdir_attr). Excludes "." / "..".

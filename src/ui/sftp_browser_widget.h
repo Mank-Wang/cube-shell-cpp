@@ -41,14 +41,15 @@ public:
     explicit SftpBrowserWidget(QWidget *parent = nullptr);
     ~SftpBrowserWidget() override;
 
-    // Attach to a connected client and load the current/home directory.
+    // Attach to a connected client and load the current directory. On first
+    // connection, resolve the SFTP login directory before listing anything.
     // SSH 重连换对象时，先停旧任务并销毁旧 SFTP/上传组件，再绑定新连接。
     // 以 shared_ptr 持有，保证应用关闭时 SshClient（及其底层 LIBSSH2_SESSION）
     // 比子对象 SftpClient 活得久——否则 terminal 先析构会 libssh2_session_free，
     // SftpClient::close() 再用悬空的 m_sftp 调 libssh2_sftp_shutdown → UAF 崩溃。
     void setClient(std::shared_ptr<SshClient> client);
 
-    // 切换整棵树的根目录（follow_folder 联动 / OSC7 初始 home 目录）。
+    // 切换整棵树的根目录（follow_folder 联动 / 显式指定初始目录）。
     // 客户端尚未挂接时仅记录路径，setClient 时再加载；展开子目录不改变它。
     // 对应Python: cube-shell.py::_on_cwd_changed → refreshDirs
     void setCurrentPath(const QString &path);
@@ -156,8 +157,8 @@ private:
     //  CwdSync       — 终端 OSC 7 上报 cwd 的联动：这是我们替用户猜的，猜错了
     //                  不能弹错误。终端 cwd 与 SFTP 通道可能压根不是同一个
     //                  命名空间（跳板机代理、chroot 过的 sftp 子系统都会这样）。
-    //  Initial       — setClient 的首次加载，同样属于推测（m_cwd 可能是连接
-    //                  就绪前由 setCurrentPath 种进来的终端 cwd）。
+    //  Initial       — setClient 加载登录目录或恢复重连前的位置。未知初始路径
+    //                  先由 SFTP 解析，失败只提示；已有路径保留兼容性回退。
     enum class LoadReason { UserRequested, CwdSync, Initial };
     // 加载并替换整棵树的根目录。preserveTree=true 用于根目录刷新：按文件名
     // 更新顶层条目，已加载的子孙分支和展开状态不丢。
@@ -257,7 +258,8 @@ private:
     // 状态栏完整文本（未截断），resize 后据此重新截断。
     QString m_statusFullText;
 
-    QString m_cwd = QStringLiteral("/");
+    // 空表示尚未确定初始目录，不能把未知路径当成服务器根目录展示。
+    QString m_cwd;
     // 最近一次成功加载的目录条目数（不含 ".."）：状态栏在筛选开关间还原计数用。
     int m_entryCount = 0;
     // 表头排序状态（跨目录保持；默认按文件名升序，与原 ls 风格预排序一致）。

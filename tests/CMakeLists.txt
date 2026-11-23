@@ -560,6 +560,11 @@ target_link_libraries(sftp_reconnect_test PRIVATE
 )
 add_test(NAME sftp_reconnect_test COMMAND sftp_reconnect_test)
 add_test(NAME sftp_reconnect_integration_test COMMAND sftp_reconnect_test --integration)
+add_test(NAME sftp_initial_directory_integration_test COMMAND sftp_reconnect_test --initial-directory)
+add_test(NAME sftp_initial_directory_sync_integration_test
+    COMMAND sftp_reconnect_test --initial-directory --sync-while-loading)
+set_tests_properties(sftp_initial_directory_integration_test sftp_initial_directory_sync_integration_test
+    PROPERTIES SKIP_RETURN_CODE 2 TIMEOUT 60)
 set_tests_properties(sftp_reconnect_test PROPERTIES TIMEOUT 60)
 set_tests_properties(sftp_reconnect_integration_test PROPERTIES SKIP_RETURN_CODE 2 TIMEOUT 120)
 

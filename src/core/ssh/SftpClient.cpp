@@ -202,13 +202,15 @@ bool SftpClient::open(SshError &error)
         error.message = QStringLiteral("SFTP: connection is closing");
         return false;
     }
-    if (m_sftp)
-        return true;
     if (!m_client || !m_client->rawSession()) {
         error.message = QStringLiteral("SFTP: not connected");
         return false;
     }
     QMutexLocker<QRecursiveMutex> lock(&m_client->sessionLock());
+    // Initial home resolution and a queued cwd sync may arrive concurrently.
+    // Recheck under the lock so they cannot open two subsystem handles.
+    if (m_sftp)
+        return true;
     _LIBSSH2_SFTP *sftp = sftpRetryPtr(m_client, [&] {
         return libssh2_sftp_init(m_client->rawSession());
     }, &m_teardown);
@@ -320,6 +322,28 @@ static void fillInfo(const QString &name, const QString &longname,
             // UI 回退只显示 name——与 Python n[8] 行为一致。
         }
     }
+}
+
+QString SftpClient::realpath(const QString &path, SshError &error)
+{
+    if (!ensureOpen(error))
+        return {};
+    QMutexLocker<QRecursiveMutex> lock(&m_client->sessionLock());
+    const QByteArray encoded = path.toUtf8();
+    QByteArray resolved(4096, '\0');
+    const int length = sftpRetryInt(m_client, [&] {
+        return libssh2_sftp_realpath(m_sftp, encoded.constData(),
+                                    resolved.data(), unsigned(resolved.size()));
+    }, &m_teardown);
+    if (length <= 0) {
+        fillSftpError(m_sftp, m_client, error, QStringLiteral("realpath failed: %1").arg(path));
+        return {};
+    }
+    if (length >= resolved.size() || resolved.front() != '/') {
+        error.message = QStringLiteral("SFTP: invalid absolute path returned for %1").arg(path);
+        return {};
+    }
+    return QString::fromUtf8(resolved.constData(), length);
 }
 
 QStringList SftpClient::listdir(const QString &path, SshError &error)
