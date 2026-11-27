@@ -1,26 +1,36 @@
 #include "SettingsDialog.h"
 
+#include <QAbstractItemView>
 #include <QApplication>
+#include <QBrush>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFontComboBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSpinBox>
 #include <QTabWidget>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QVBoxLayout>
+#include <QVector>
 
 #include "LanguageManager.h"
 #include "config/GlobalState.h"
+#include "config/HighlightRulesStore.h"
 #include "util/ThemeManager.h"
 
 namespace cubeshell {
@@ -47,6 +57,84 @@ static void addFullTextToolTip(QComboBox *combo)
     QObject::connect(combo, &QComboBox::currentTextChanged, combo,
                      [combo](const QString &text) { combo->setToolTip(text); });
     combo->setToolTip(combo->currentText());
+}
+
+// 高亮规则表格的列号。
+constexpr int kHlColEnabled = 0;
+constexpr int kHlColName = 1;
+constexpr int kHlColPattern = 2;
+constexpr int kHlColCase = 3;
+constexpr int kHlColColor = 4;
+
+// 颜色按钮：色块背景 + 十六进制文字；按亮度选黑/白字保证可读。
+// 选中的颜色存在按钮的 hlColor 属性里，currentHighlightRules() 从那里取回。
+static void paintHighlightColorButton(QPushButton *button, const QColor &color)
+{
+    button->setProperty("hlColor", color);
+    const QColor shown = color.isValid() ? color : QColor(Qt::gray);
+    const QString textColor = (shown.lightness() < 128) ? QStringLiteral("#ffffff")
+                                                        : QStringLiteral("#000000");
+    button->setText(color.isValid() ? color.name(QColor::HexRgb) : QObject::tr("未设置"));
+    button->setStyleSheet(
+        QStringLiteral("QPushButton { background-color: %1; color: %2;"
+                       " border: 1px solid #888; padding: 2px 8px; }")
+            .arg(shown.name(QColor::HexRgb), textColor));
+}
+
+static QTableWidgetItem *makeCheckableItem(bool checked)
+{
+    auto *item = new QTableWidgetItem;
+    item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
+    item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+    return item;
+}
+
+// 把「逐字符首匹配优先」的着色结果渲染成富文本，语义与终端
+// TerminalDisplay::_computeHighlightMap() 一致：靠上的规则先占住字符。
+static QString highlightPreviewHtml(const QString &text,
+                                    const QList<Konsole::HighlightRule> &rules,
+                                    const QColor &defaultColor)
+{
+    QVector<QColor> colors(text.size());
+    for (const Konsole::HighlightRule &rule : rules) {
+        if (!rule.enabled || rule.pattern.trimmed().isEmpty() || !rule.foreground.isValid())
+            continue;
+        QRegularExpression re(rule.pattern);
+        re.setPatternOptions(rule.caseSensitive
+                                 ? QRegularExpression::NoPatternOption
+                                 : QRegularExpression::CaseInsensitiveOption);
+        if (!re.isValid())
+            continue;
+        QRegularExpressionMatchIterator it = re.globalMatch(text);
+        while (it.hasNext()) {
+            const QRegularExpressionMatch match = it.next();
+            const int start = qMax(0, int(match.capturedStart()));
+            const int end = qMin(int(match.capturedEnd()), int(colors.size()));
+            for (int i = start; i < end; ++i) {
+                if (!colors[i].isValid())
+                    colors[i] = rule.foreground;
+            }
+        }
+    }
+
+    QString html;
+    html.reserve(text.size() * 5);
+    for (int i = 0; i < text.size();) {
+        const QColor color = colors[i].isValid() ? colors[i] : defaultColor;
+        int j = i + 1;
+        while (j < text.size()) {
+            const QColor next = colors[j].isValid() ? colors[j] : defaultColor;
+            if (next != color)
+                break;
+            ++j;
+        }
+        QString chunk = text.mid(i, j - i).toHtmlEscaped();
+        chunk.replace(QLatin1Char(' '), QStringLiteral("&#160;"));   // 保留连续空格
+        html += QStringLiteral("<span style=\"color:%1\">%2</span>")
+                    .arg(color.name(QColor::HexRgb), chunk);
+        i = j;
+    }
+    return html;
 }
 
 // QSettings 键（组织/应用名见 app/main.cpp 的 setOrganizationName）。
@@ -78,6 +166,9 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     m_tabWidget->addTab(createThemeTab(), tr("主题设置"));
     m_tabWidget->addTab(createLanguageTab(), tr("语言设置"));
     m_tabWidget->addTab(createGeneralTab(), tr("通用"));
+    // 高亮规则页插在通用之后：代理页必须保持最后，现有 setCurrentTab(0/1/2)
+    // 的入口调用不受影响。
+    m_tabWidget->addTab(createHighlightTab(), tr("高亮规则"));
     // 代理页排在最后：既有的 setCurrentTab 调用点用的是 0/1/2 三个字面量
     // （见其声明处的注释），插在中间会把那些入口全部错位。
     m_tabWidget->addTab(createProxyTab(), tr("代理"));
@@ -291,6 +382,276 @@ QWidget *SettingsDialog::createGeneralTab()
     return page;
 }
 
+// 高亮规则 Tab：WindTerm 风格的文本正则高亮。
+// 表格行序即优先级（第一行优先），与终端「首匹配优先」的着色语义一致。
+QWidget *SettingsDialog::createHighlightTab()
+{
+    auto *page = new QWidget(this);
+    auto *layout = new QVBoxLayout(page);
+
+    auto *tip = new QLabel(
+        tr("规则从上到下依次匹配，第一个命中的颜色生效；用「上移 / 下移」调整优先级。\n"
+           "文件权限串（drwxr-xr-x）始终按位着色，不在本列表中。\n"
+           "提示：用户正则运行在界面线程，过于复杂的表达式（如 (a+)+$）可能造成卡顿。"),
+        page);
+    tip->setWordWrap(true);
+    tip->setStyleSheet(QStringLiteral("color: gray;"));
+    layout->addWidget(tip);
+
+    m_highlightTable = new QTableWidget(0, 5, page);
+    m_highlightTable->setHorizontalHeaderLabels(
+        {tr("启用"), tr("规则名称"), tr("正则表达式"), tr("区分大小写"), tr("颜色")});
+    m_highlightTable->verticalHeader()->setVisible(false);
+    m_highlightTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_highlightTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_highlightTable->setAlternatingRowColors(true);
+    QHeaderView *header = m_highlightTable->horizontalHeader();
+    header->setSectionResizeMode(kHlColEnabled, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(kHlColName, QHeaderView::Interactive);
+    header->setSectionResizeMode(kHlColPattern, QHeaderView::Stretch);
+    header->setSectionResizeMode(kHlColCase, QHeaderView::ResizeToContents);
+    header->setSectionResizeMode(kHlColColor, QHeaderView::ResizeToContents);
+    m_highlightTable->setColumnWidth(kHlColName, 140);
+    layout->addWidget(m_highlightTable, 1);
+
+    // 正则就地校验：非法行标红并给出 errorString，保存时仍会统一拦截。
+    connect(m_highlightTable, &QTableWidget::itemChanged, this,
+            [this](QTableWidgetItem *item) {
+                if (!item || item->column() != kHlColPattern)
+                    return;
+                const QString pattern = item->text();
+                QRegularExpression re(pattern);
+                const bool ok = !pattern.trimmed().isEmpty() && re.isValid();
+                {
+                    QSignalBlocker blocker(m_highlightTable);
+                    if (ok) {
+                        item->setData(Qt::BackgroundRole, QVariant());
+                        item->setToolTip(QString());
+                    } else {
+                        item->setData(Qt::BackgroundRole,
+                                      QBrush(QColor(220, 80, 80, 120)));
+                        item->setToolTip(pattern.trimmed().isEmpty()
+                                             ? tr("正则不能为空")
+                                             : re.errorString());
+                    }
+                }
+                updateHighlightPreview();
+            });
+
+    auto *buttons = new QHBoxLayout;
+    auto *addButton = new QPushButton(tr("新增"), page);
+    auto *copyButton = new QPushButton(tr("复制"), page);
+    auto *removeButton = new QPushButton(tr("删除"), page);
+    auto *upButton = new QPushButton(tr("上移"), page);
+    auto *downButton = new QPushButton(tr("下移"), page);
+    auto *restoreButton = new QPushButton(tr("恢复默认"), page);
+    for (QPushButton *button : {addButton, copyButton, removeButton,
+                                upButton, downButton, restoreButton})
+        buttons->addWidget(button);
+    buttons->addStretch(1);
+    layout->addLayout(buttons);
+
+    connect(addButton, &QPushButton::clicked, this, [this] {
+        QList<Konsole::HighlightRule> rules = currentHighlightRules();
+        Konsole::HighlightRule rule;
+        rule.name = tr("新规则");
+        rule.pattern = QStringLiteral("error");
+        rule.foreground = QColor(QStringLiteral("#e74c3c"));
+        rules.append(rule);
+        setHighlightRows(rules);
+        m_highlightTable->selectRow(rules.size() - 1);
+        m_highlightTable->setCurrentCell(rules.size() - 1, kHlColPattern);
+    });
+
+    connect(copyButton, &QPushButton::clicked, this, [this] {
+        const int row = m_highlightTable->currentRow();
+        if (row < 0)
+            return;
+        QList<Konsole::HighlightRule> rules = currentHighlightRules();
+        rules.insert(row + 1, rules.at(row));
+        setHighlightRows(rules);
+        m_highlightTable->selectRow(row + 1);
+    });
+
+    connect(removeButton, &QPushButton::clicked, this, [this] {
+        const int row = m_highlightTable->currentRow();
+        if (row < 0)
+            return;
+        QList<Konsole::HighlightRule> rules = currentHighlightRules();
+        rules.removeAt(row);
+        setHighlightRows(rules);
+        if (!rules.isEmpty())
+            m_highlightTable->selectRow(qMin(row, rules.size() - 1));
+    });
+
+    auto moveRow = [this](int step) {
+        const int row = m_highlightTable->currentRow();
+        const int target = row + step;
+        if (row < 0 || target < 0 || target >= m_highlightTable->rowCount())
+            return;
+        QList<Konsole::HighlightRule> rules = currentHighlightRules();
+        rules.swapItemsAt(row, target);
+        setHighlightRows(rules);
+        m_highlightTable->selectRow(target);
+    };
+    connect(upButton, &QPushButton::clicked, this, [moveRow] { moveRow(-1); });
+    connect(downButton, &QPushButton::clicked, this, [moveRow] { moveRow(1); });
+
+    connect(restoreButton, &QPushButton::clicked, this, [this] {
+        setHighlightRows(Konsole::builtinHighlightRules());
+        m_highlightTable->selectRow(0);
+    });
+
+    // 实时预览：改规则、改色、启停、键入样例都会重算。
+    auto *previewRow = new QHBoxLayout;
+    previewRow->addWidget(new QLabel(tr("预览文本："), page));
+    m_highlightPreviewInput = new QLineEdit(
+        tr("Could not connect to 192.168.1.10: success=1 failed=0 warning"), page);
+    previewRow->addWidget(m_highlightPreviewInput, 1);
+    layout->addLayout(previewRow);
+
+    m_highlightPreview = new QLabel(page);
+    m_highlightPreview->setTextFormat(Qt::RichText);
+    m_highlightPreview->setWordWrap(true);
+    m_highlightPreview->setMinimumHeight(30);
+    m_highlightPreview->setStyleSheet(QStringLiteral(
+        "background: palette(base); border: 1px solid palette(mid); padding: 4px;"));
+    layout->addWidget(m_highlightPreview);
+
+    connect(m_highlightPreviewInput, &QLineEdit::textChanged, this,
+            [this](const QString &) { updateHighlightPreview(); });
+    // 勾选/取消勾选也要刷新预览。
+    connect(m_highlightTable, &QTableWidget::itemChanged, this,
+            [this](QTableWidgetItem *) { updateHighlightPreview(); });
+
+    return page;
+}
+
+// 整表重建。上移/下移/复制/恢复默认都走这里，避免带 cellWidget 的行搬运。
+void SettingsDialog::setHighlightRows(const QList<Konsole::HighlightRule> &rules)
+{
+    if (!m_highlightTable)
+        return;
+
+    QSignalBlocker blocker(m_highlightTable);
+    m_highlightTable->setRowCount(0);
+    for (const Konsole::HighlightRule &rule : rules) {
+        const int row = m_highlightTable->rowCount();
+        m_highlightTable->insertRow(row);
+
+        m_highlightTable->setItem(row, kHlColEnabled, makeCheckableItem(rule.enabled));
+
+        auto *nameItem = new QTableWidgetItem(rule.name);
+        nameItem->setFlags(nameItem->flags() | Qt::ItemIsEditable);
+        m_highlightTable->setItem(row, kHlColName, nameItem);
+
+        auto *patternItem = new QTableWidgetItem(rule.pattern);
+        patternItem->setFlags(patternItem->flags() | Qt::ItemIsEditable);
+        if (!patternItem->text().trimmed().isEmpty()) {
+            QRegularExpression re(patternItem->text());
+            if (!re.isValid()) {
+                patternItem->setData(Qt::BackgroundRole,
+                                     QBrush(QColor(220, 80, 80, 120)));
+                patternItem->setToolTip(re.errorString());
+            }
+        }
+        m_highlightTable->setItem(row, kHlColPattern, patternItem);
+
+        m_highlightTable->setItem(row, kHlColCase, makeCheckableItem(rule.caseSensitive));
+
+        auto *colorButton = new QPushButton(m_highlightTable);
+        colorButton->setCursor(Qt::PointingHandCursor);
+        paintHighlightColorButton(colorButton, rule.foreground);
+        connect(colorButton, &QPushButton::clicked, this, [this, colorButton] {
+            const QColor current = colorButton->property("hlColor").value<QColor>();
+            const QColor picked =
+                QColorDialog::getColor(current, this, tr("选择高亮颜色"));
+            if (!picked.isValid())
+                return;
+            paintHighlightColorButton(colorButton, picked);
+            updateHighlightPreview();
+        });
+        m_highlightTable->setCellWidget(row, kHlColColor, colorButton);
+    }
+
+    updateHighlightPreview();
+}
+
+QList<Konsole::HighlightRule> SettingsDialog::currentHighlightRules() const
+{
+    QList<Konsole::HighlightRule> rules;
+    if (!m_highlightTable)
+        return rules;
+
+    rules.reserve(m_highlightTable->rowCount());
+    for (int row = 0; row < m_highlightTable->rowCount(); ++row) {
+        Konsole::HighlightRule rule;
+        if (auto *item = m_highlightTable->item(row, kHlColEnabled))
+            rule.enabled = item->checkState() == Qt::Checked;
+        if (auto *item = m_highlightTable->item(row, kHlColName))
+            rule.name = item->text();
+        if (auto *item = m_highlightTable->item(row, kHlColPattern))
+            rule.pattern = item->text();
+        if (auto *item = m_highlightTable->item(row, kHlColCase))
+            rule.caseSensitive = item->checkState() == Qt::Checked;
+        if (auto *button = qobject_cast<QPushButton *>(
+                m_highlightTable->cellWidget(row, kHlColColor))) {
+            rule.foreground = button->property("hlColor").value<QColor>();
+        }
+        rules.append(rule);
+    }
+    return rules;
+}
+
+bool SettingsDialog::validateHighlightRules(QString *errorOut, int *badRow) const
+{
+    if (!m_highlightTable)
+        return true;
+
+    for (int row = 0; row < m_highlightTable->rowCount(); ++row) {
+        auto *enabledItem = m_highlightTable->item(row, kHlColEnabled);
+        // 停用的规则不参与匹配，正则坏了也不阻断保存。
+        if (!enabledItem || enabledItem->checkState() != Qt::Checked)
+            continue;
+
+        auto *nameItem = m_highlightTable->item(row, kHlColName);
+        const QString name = (nameItem && !nameItem->text().isEmpty())
+                                 ? nameItem->text()
+                                 : tr("未命名");
+        auto *patternItem = m_highlightTable->item(row, kHlColPattern);
+        const QString pattern = patternItem ? patternItem->text() : QString();
+
+        QRegularExpression re(pattern);
+        if (pattern.trimmed().isEmpty()) {
+            if (badRow)
+                *badRow = row;
+            if (errorOut)
+                *errorOut = tr("第 %1 行「%2」的正则不能为空。").arg(row + 1).arg(name);
+            return false;
+        }
+        if (!re.isValid()) {
+            if (badRow)
+                *badRow = row;
+            if (errorOut)
+                *errorOut = tr("第 %1 行「%2」的正则无效：%3")
+                                .arg(row + 1)
+                                .arg(name, re.errorString());
+            return false;
+        }
+    }
+    return true;
+}
+
+void SettingsDialog::updateHighlightPreview()
+{
+    if (!m_highlightPreview || !m_highlightPreviewInput)
+        return;
+    const QColor defaultColor =
+        m_highlightPreview->palette().color(QPalette::WindowText);
+    m_highlightPreview->setText(highlightPreviewHtml(
+        m_highlightPreviewInput->text(), currentHighlightRules(), defaultColor));
+}
+
 // 代理 Tab：那份「全局代理」。设备的代理类型选「全局代理」时取的就是这里。
 // Python 版没有代理功能，故无对应实现。
 QWidget *SettingsDialog::createProxyTab()
@@ -404,6 +765,9 @@ void SettingsDialog::loadCurrentSettings()
     m_logTimestamps->setChecked(state.sessionLogTimestamps());
     m_logMaxMB->setValue(state.sessionLogMaxMB());
     m_logBackupCount->setValue(state.sessionLogBackupCount());
+
+    // 高亮规则：C++ 专属，只走 QSettings（键不存在时回退内置默认）。
+    setHighlightRows(loadHighlightRules());
 }
 
 int SettingsDialog::sshTimeoutSeconds() const
@@ -430,6 +794,19 @@ void SettingsDialog::accept()
             m_tabWidget->setCurrentIndex(m_tabWidget->indexOf(proxyPage));
         QMessageBox::warning(this, tr("代理设置"), proxyErr);
         return;   // 刻意不调 QDialog::accept()：对话框留着让用户改
+    }
+
+    // 高亮规则：任何一条「启用中」的规则正则非法就停在原地，
+    // 与代理页同样的处理方式——留着对话框让用户改那一行。
+    QString hlErr;
+    int hlBadRow = -1;
+    if (!validateHighlightRules(&hlErr, &hlBadRow)) {
+        if (QWidget *hlPage = m_highlightTable->parentWidget())
+            m_tabWidget->setCurrentIndex(m_tabWidget->indexOf(hlPage));
+        if (hlBadRow >= 0)
+            m_highlightTable->selectRow(hlBadRow);
+        QMessageBox::warning(this, tr("高亮规则"), hlErr);
+        return;
     }
 
     // 主题：实时预览已应用，这里确认并落盘。
@@ -520,6 +897,16 @@ void SettingsDialog::accept()
         // 对应Python: show_language_settings 里的重启提示
         QMessageBox::information(this, tr("语言设置"),
                                  tr("语言设置已更改，请重启应用程序以生效。"));
+    }
+
+    // 高亮规则：C++ 专属，只写 QSettings。保存成功后通知主窗口把规则
+    // 应用到已打开的终端（无需重开会话）。
+    QString hlSaveErr;
+    if (saveHighlightRules(currentHighlightRules(), &hlSaveErr)) {
+        emit highlightRulesChanged();
+    } else {
+        QMessageBox::warning(this, windowTitle(),
+                             tr("保存高亮规则失败: %1").arg(hlSaveErr));
     }
 
     QDialog::accept();

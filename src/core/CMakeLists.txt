@@ -45,6 +45,7 @@ set(CORE_SOURCES
     config/ConfigUtil.cpp       # JSON/TOML config loading helpers
     config/Secrets.cpp          # port of keyring-backed secret storage
     config/SecretMigration.cpp  # 明文密码 → 钥匙串的一次性迁移
+    config/HighlightRulesStore.cpp # WindTerm 风格高亮规则的 QSettings 持久化
 
     # --- util ---
     util/StringUtil.cpp         # port of function/util.py string helpers

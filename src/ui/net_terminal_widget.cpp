@@ -20,6 +20,7 @@
 #include "net/TelnetProtocol.h"
 
 #include "config/GlobalState.h"
+#include "config/HighlightRulesStore.h"
 
 #include "dialogs/NetConnectDialog.h"   // netcombo 辅助函数
 #include "terminal_theme_util.h"
@@ -113,6 +114,8 @@ NetTerminalWidget::NetTerminalWidget(const QString &mode, QWidget *parent)
             [this](const QString &name) { applyTerminalThemeEverywhere(name, this); });
     // 回滚缓冲行数（同时决定“查找”能检索到多久以前的输出）。
     m_term->setHistorySize(GlobalState::instance().scrollbackLines());
+    // WindTerm 风格文本正则高亮：用户保存过规则就用用户的，否则沿用内置默认。
+    applyHighlightRules(m_term);
     m_term->setScrollBarPosition(ScrollBarRight);
 
     // 不挂 TerminalCommandSuggest：命令提示是 shell 语义，对面可能是交换机

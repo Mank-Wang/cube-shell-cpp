@@ -55,6 +55,20 @@ target_link_libraries(config_store_test PRIVATE
     cube_core
 )
 
+# WindTerm 风格高亮规则：内置正则可编译、短语/关键字命中、存取往返。
+qt_add_executable(highlight_rules_test
+    highlight_rules_test.cpp
+)
+target_include_directories(highlight_rules_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/qtermwidget
+)
+target_link_libraries(highlight_rules_test PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    cube_core
+)
+
 # KnownHostsStore parser / checker / persistence test.
 qt_add_executable(known_hosts_test
     known_hosts_test.cpp
@@ -586,6 +600,8 @@ target_link_libraries(file_browser_test PRIVATE
 )
 
 # 文本编辑器：智能缩进、查找替换、保存竞态与窗口状态的无头回归测试。
+# （本地打包构建的权宜之计：该源文件目前不在仓库里，存在时才创建目标。）
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/text_editor_test.cpp)
 qt_add_executable(text_editor_test
     text_editor_test.cpp
 )
@@ -601,6 +617,7 @@ target_link_libraries(text_editor_test PRIVATE
     cube_ui
     cube_core
 )
+endif()
 
 # 设备列表右键菜单的作用范围（多选删除 / 右键落在选区外时收敛选区）。
 # 走真实的 onContextMenu + QMenu，离屏平台，不碰用户 groups.json。
@@ -872,6 +889,7 @@ add_test(NAME qterm_smoke COMMAND qterm_smoke)
 add_test(NAME shift_tab_test COMMAND shift_tab_test)
 add_test(NAME pickle_test COMMAND pickle_test)
 add_test(NAME config_store_test COMMAND config_store_test)
+add_test(NAME highlight_rules_test COMMAND highlight_rules_test)
 add_test(NAME known_hosts_test COMMAND known_hosts_test)
 add_test(NAME credential_kind_test COMMAND credential_kind_test)
 add_test(NAME session_recorder_test COMMAND session_recorder_test)

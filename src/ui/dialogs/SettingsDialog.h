@@ -7,16 +7,20 @@
 // OK 保存到 QSettings，并同步 GlobalState（theme.json，与 Python 版共享）。
 
 #include <QDialog>
+#include <QList>
 
+#include "HighlightRule.h"      // Konsole::HighlightRule（qtermwidget PUBLIC include）
 #include "ProxySettingsWidget.h"
 
 class QCheckBox;
 class QComboBox;
 class QFontComboBox;
+class QLabel;
 class QLineEdit;
 class QListWidget;
 class QSpinBox;
 class QTabWidget;
+class QTableWidget;
 
 namespace cubeshell {
 
@@ -25,7 +29,8 @@ class SettingsDialog : public QDialog {
 public:
     explicit SettingsDialog(QWidget *parent = nullptr);
 
-    // 打开后选中指定 Tab（0=主题 1=语言 2=通用 3=代理），供不同菜单入口定位。
+    // 打开后选中指定 Tab（0=主题 1=语言 2=通用 3=高亮规则 4=代理），
+    // 供不同菜单入口定位。
     void setCurrentTab(int index);
 
     // --- 代理页 ------------------------------------------------------------
@@ -64,13 +69,26 @@ signals:
     void scrollbackLinesChanged(int lines);
     // 命令补全开关已修改，已打开的终端可即时生效（无需重开会话）。
     void commandCompletionEnabledChanged(bool enabled);
+    // 高亮规则已保存，已打开的终端应重新加载（applyHighlightRules）。
+    void highlightRulesChanged();
 
 private:
     QWidget *createThemeTab();
     QWidget *createLanguageTab();
     QWidget *createGeneralTab();
+    QWidget *createHighlightTab();
     QWidget *createProxyTab();
     void loadCurrentSettings();
+
+    // --- 高亮规则页 --------------------------------------------------------
+    // 用整表重建代替逐行增删：上移/下移/恢复默认都走这一条路径，
+    // 避免带 cellWidget（颜色按钮）的行搬运出错。
+    void setHighlightRows(const QList<Konsole::HighlightRule> &rules);
+    QList<Konsole::HighlightRule> currentHighlightRules() const;
+    // 校验所有「启用中」的规则；失败时返回 false 并给出错误文案与行号。
+    bool validateHighlightRules(QString *errorOut = nullptr, int *badRow = nullptr) const;
+    // 按当前规则表与预览输入框重算富文本预览（首匹配优先，与终端一致）。
+    void updateHighlightPreview();
 
     QTabWidget *m_tabWidget = nullptr;
     QListWidget *m_themeList = nullptr;   // dark / light（选中即实时预览）
@@ -94,6 +112,10 @@ private:
     QSpinBox *m_logMaxMB = nullptr;             // 单文件上限 MB（0=不轮转）
     QSpinBox *m_logBackupCount = nullptr;       // 轮转保留卷数
     ProxySettingsWidget *m_proxy = nullptr;   // 「代理」页：那份全局代理
+    // 「高亮规则」页：行序即优先级，颜色存在第 4 列 QPushButton 的 hlColor 属性里。
+    QTableWidget *m_highlightTable = nullptr;
+    QLineEdit *m_highlightPreviewInput = nullptr;
+    QLabel *m_highlightPreview = nullptr;
     QString m_originalAppearance;         // Cancel 时还原实时预览
 };
 

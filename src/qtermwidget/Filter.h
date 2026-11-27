@@ -325,6 +325,10 @@ public:
 
     // 对应C++: void addFilter(Filter* filter)
     void addFilter(Filter *filter);
+    // 把过滤器插到链首（cube-shell 新增）：最后 prepend 的过滤器最先被
+    // _computeHighlightMap() 看到，因而在「首匹配优先」下拥有最高优先级。
+    // 搜索高亮用它保证始终压过用户自定义高亮规则。
+    void prependFilter(Filter *filter);
     // 对应C++: void removeFilter(Filter* filter)
     void removeFilter(Filter *filter);
     // 对应C++: bool containsFilter(Filter* filter)

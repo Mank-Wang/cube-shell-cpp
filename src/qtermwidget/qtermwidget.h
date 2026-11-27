@@ -30,6 +30,7 @@
 #include "ColorScheme.h"      // ColorEntry, ColorSchemeManager, TABLE_COLORS
 #include "Emulation.h"        // Konsole::KeyboardCursorShape
 #include "Filter.h"           // Konsole::Filter::HotSpot
+#include "HighlightRule.h"    // Konsole::HighlightRule (WindTerm 风格高亮规则)
 #include "TerminalDisplay.h"  // Konsole::ScrollBarPosition 等枚举 + 视图类型
 
 class QAction;
@@ -292,6 +293,15 @@ public:
     Konsole::Filter::HotSpot *getHotSpotAt(const QPoint &pos);
     Konsole::Filter::HotSpot *getHotSpotAt(int row, int column);
 
+    // --- WindTerm 风格文本正则高亮 -------------------------------------------
+    //
+    // 整表替换当前高亮规则并立即重绘，已打开的会话无需重开。
+    // 规则顺序即优先级：靠上的规则先命中，命中字符不再被后续规则覆盖。
+    // 文件权限串（drwxr-xr-x）由 PermissionHighlightFilter 固定提供，不在规则表内。
+    void setHighlightRules(const QList<Konsole::HighlightRule> &rules);
+    // 当前生效的规则表（构造函数里为 builtinHighlightRules()）。
+    QList<Konsole::HighlightRule> highlightRules() const;
+
     // 对应C++: void setKeyboardCursorShape(KeyboardCursorShape shape)
     void setKeyboardCursorShape(KeyboardCursorShape shape);
 
@@ -406,6 +416,8 @@ private:
     void connectSessionSignals();
     void setupUrlFilter();
     void setupCustomFilters();
+    // 按 m_highlightRules 重建过滤器链上的用户高亮规则，并立即重绘。
+    void rebuildHighlightFilters();
     void setupSearchBar();
     void connectTerminalDisplaySignals();
     void setupDefaultFont();
@@ -425,6 +437,9 @@ private:
 
     // 搜索高亮过滤器。链的 removeFilter() 不负责 delete，本类自行管理生命周期。
     Konsole::HighlightFilter *m_searchHighlightFilter = nullptr;
+    // 用户可配置的高亮规则及其实例化的过滤器（同样由本类管理生命周期）。
+    QList<Konsole::HighlightRule> m_highlightRules;
+    QList<Konsole::HighlightFilter *> m_highlightFilters;
     // 上一次命中的位置，用于识别搜索回绕（跳转方向与预期相反即为回绕）。
     int m_lastMatchLine = -1;
     int m_lastMatchColumn = -1;

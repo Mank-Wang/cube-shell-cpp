@@ -64,6 +64,7 @@
 #include "dialogs/TunnelConfigWidget.h"
 
 #include "config/GlobalState.h"
+#include "config/HighlightRulesStore.h"
 #include "config/SecretMigration.h"
 #include "ai/AiChatPanel.h"
 #include "ai/CommandConfirmDialog.h"
@@ -3004,6 +3005,8 @@ QTermWidget *MainWindow::openLocalTerminalAt(const QString &startDir)
             [this](const QString &name) { applyTerminalThemeEverywhere(name, this); });
     // 回滚缓冲行数（同时决定“查找”能检索到多久以前的输出）。
     term->setHistorySize(GlobalState::instance().scrollbackLines());
+    // WindTerm 风格文本正则高亮：用户保存过规则就用用户的，否则沿用内置默认。
+    applyHighlightRules(term);
     // 右键菜单"AI" → 切换 AI 助手面板。
     // 对应Python: ai_action → self.window()._toggle_ai_panel()
     connect(term, &QTermWidget::aiRequested, this, &MainWindow::toggleAiPanel);
@@ -3466,6 +3469,12 @@ void MainWindow::showSettings(int tabIndex)
             findChildren<TerminalCommandSuggest *>();
         for (TerminalCommandSuggest *s : suggests)
             s->setEnabled(on);
+    });
+    // 高亮规则保存后即时重载到所有已打开终端（SSH / Telnet / 串口 / 本地）。
+    connect(&dlg, &SettingsDialog::highlightRulesChanged, this, [this] {
+        const QList<QTermWidget *> terms = findChildren<QTermWidget *>();
+        for (QTermWidget *t : terms)
+            applyHighlightRules(t);
     });
     if (dlg.exec() != QDialog::Accepted)
         return;

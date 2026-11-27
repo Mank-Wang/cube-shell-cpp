@@ -313,54 +313,65 @@ void QTermWidget::setupUrlFilter()
 
 void QTermWidget::setupCustomFilters()
 {
-    // 对应 Python setup_custom_filters():设置自定义高亮过滤器 (WindTerm 风格)。
-    // 过滤器链拥有过滤器所有权,随 TerminalDisplay 销毁。
-    FilterChain *filterChain = m_impl->m_terminalDisplay->filterChain();
+    // 文件权限串（drwxr-xr-x）固定按 d/r/w/x 逐字符着色，不列入用户可编辑规则。
+    // 先于用户规则挂载：首匹配优先后，权限串字符不会被普通规则再次上色。
+    m_impl->m_terminalDisplay->filterChain()->addFilter(new PermissionHighlightFilter());
 
-    // 1. 权限字符串高亮 (drwxr-xr-x)
-    filterChain->addFilter(new PermissionHighlightFilter());
+    // 内置默认规则。上层（core/config/HighlightRulesStore）若已保存用户规则，
+    // 会在构造之后调用 setHighlightRules() 整表覆盖这里。
+    setHighlightRules(Konsole::builtinHighlightRules());
+}
 
-    // 2. 数字高亮 (紫色)
-    // 匹配独立的数字或者文件大小等,但不匹配包含数字的文件名(如 file1.txt, 123.log)
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"((?<!\S)\d+(?!\S))"), QColor("#bd93f9")));
+void QTermWidget::setHighlightRules(const QList<Konsole::HighlightRule> &rules)
+{
+    m_highlightRules = rules;
+    rebuildHighlightFilters();
+}
 
-    // 3. 日期时间高亮 (绿色)
-    // 匹配像 "Nov 29" 或 "11:30" 或 "2025-11-29"
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\b|\b\d{2}:\d{2}\b|\b\d{4}-\d{2}-\d{2}\b)"),
-        QColor("#50fa7b")));
+QList<Konsole::HighlightRule> QTermWidget::highlightRules() const
+{
+    return m_highlightRules;
+}
 
-    // 4. 压缩包文件名高亮 (天蓝色) — Python 版已注释停用,保持一致
-    // filterChain->addFilter(new HighlightFilter(
-    //     QStringLiteral(R"(\b[\w\-\.]+\.(?:zip|tar\.gz|tgz|rar|7z|gz|bz2|xz)\b)"),
-    //     QColor("#8be9fd")));
+void QTermWidget::rebuildHighlightFilters()
+{
+    if (!m_impl || !m_impl->m_terminalDisplay)
+        return;
 
-    // 命令行关键字高亮
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"((?<![\w\-])(?:sudo\s+)?(?:ls|cd|vi|vim|cat|grep|tail|head|tar|zip|unzip|ssh|scp|find|chmod|chown|ps|kill|ss|systemctl|docker|service|journalctl|top|htop|netstat|ip|ifconfig)\b)"),
-        QColor("#00A1FF")));
+    FilterChain *chain = m_impl->m_terminalDisplay->filterChain();
 
-    // 命令行选项高亮 (-x / --xxx, 黄色)
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"((?<!\w)(--?[a-zA-Z0-9][\w\-]*))"), QColor("#f1c40f")));
+    // 先摘掉旧的：FilterChain::removeFilter() 只摘链、不 delete。
+    for (HighlightFilter *filter : m_highlightFilters) {
+        chain->removeFilter(filter);
+        delete filter;
+    }
+    m_highlightFilters.clear();
 
-    // 绝对路径 / ~ 路径高亮 (天蓝色)
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"((?:^|[\s;])((?:/[^ \t\n]+|~[^ \t\n]+)))"), QColor("#8be9fd")));
+    for (const HighlightRule &rule : m_highlightRules) {
+        if (!rule.enabled || rule.pattern.trimmed().isEmpty())
+            continue;
 
-    // IP 地址高亮 (橙色)
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"(\b(?:\d{1,3}\.){3}\d{1,3}\b)"), QColor("#e67e22")));
+        QRegularExpression re(rule.pattern);
+        re.setPatternOptions(rule.caseSensitive
+                                 ? QRegularExpression::NoPatternOption
+                                 : QRegularExpression::CaseInsensitiveOption);
+        if (!re.isValid()) {
+            // 设置界面保存前已校验；这里兜住外部直接调用传入的坏正则。
+            qWarning() << "QTermWidget: 忽略非法高亮正则:" << rule.pattern
+                       << re.errorString();
+            continue;
+        }
 
-    // URL 高亮 (蓝色)
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral(R"(\bhttps?://[^\s]+\b)"), QColor("#3498db")));
+        // 与搜索高亮一致：只有前景色参与渲染。
+        auto *filter = new HighlightFilter(rule.pattern, rule.foreground);
+        filter->setRegExp(re);   // 带上大小写选项
+        chain->addFilter(filter);
+        m_highlightFilters.append(filter);
+    }
 
-    // 常见错误信息高亮 (红色)
-    filterChain->addFilter(new HighlightFilter(
-        QStringLiteral("(command not found|No such file or directory|Permission denied|not recognized)"),
-        QColor("#e74c3c")));
+    // 立即对当前屏幕重跑过滤链并重绘，已打开的会话无需重开。
+    m_impl->m_terminalDisplay->processFilters();
+    m_impl->m_terminalDisplay->update();
 }
 
 void QTermWidget::setupSearchBar()
@@ -1232,10 +1243,11 @@ void QTermWidget::updateSearchHighlight()
     if (!m_searchBar->isHidden() && m_searchBar->highlightAllMatches()
         && !re.pattern().isEmpty()) {
         // HighlightFilter 只按前景色着色（背景色在 _computeHighlightMap 里被忽略），
-        // 用醒目的琥珀色区别于既有的语法高亮配色。装在链尾 → 覆盖前面的着色。
+        // 用醒目的琥珀色区别于既有的语法高亮配色。插到链首 → 在首匹配优先的
+        // 着色逻辑里压过用户自定义高亮规则，搜索命中始终可见。
         m_searchHighlightFilter = new HighlightFilter(re.pattern(), QColor("#ffb300"));
         m_searchHighlightFilter->setRegExp(re);   // 带上大小写选项
-        chain->addFilter(m_searchHighlightFilter);
+        chain->prependFilter(m_searchHighlightFilter);
     }
 
     m_impl->m_terminalDisplay->processFilters();
@@ -1455,3 +1467,84 @@ QTermWidget *createTermWidget(int startnow, QWidget *parent)
 {
     return new QTermWidget(startnow, parent);
 }
+
+// ---------------------------------------------------------------------------
+// 内置高亮规则
+// ---------------------------------------------------------------------------
+
+namespace Konsole {
+
+// WindTerm 风格的默认规则表。列表顺序即优先级，靠上的先命中：
+//   * 具体规则（日期 / IP / URL / 路径）必须排在「数字」之前，否则年份、
+//     时分、IP 里的数字会先被数字规则吃掉；
+//   * 否定短语（Could not / not xxx / no xxx）排在状态关键字之前，保证整句
+//     短语优先着色；
+//   * 「提示关键字」刻意不含 could，否则会抢在「否定短语 could not」前面。
+QList<HighlightRule> builtinHighlightRules()
+{
+    QList<HighlightRule> rules;
+
+    auto add = [&rules](const char *name, const char *pattern, const char *color,
+                        bool caseSensitive = false) {
+        HighlightRule rule;
+        rule.name = QString::fromUtf8(name);
+        rule.pattern = QString::fromUtf8(pattern);
+        rule.foreground = QColor(QString::fromLatin1(color));
+        rule.caseSensitive = caseSensitive;
+        rule.enabled = true;
+        rules.append(rule);
+    };
+
+    // 1. 日期时间：Nov 29 / 11:30 / 11:30:05 / 2025-11-29
+    add("日期时间",
+        R"(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\b|\b\d{2}:\d{2}(?::\d{2})?\b|\b\d{4}-\d{2}-\d{2}\b)",
+        "#50fa7b");
+
+    // 2. IP 地址
+    add("IP 地址", R"(\b(?:\d{1,3}\.){3}\d{1,3}\b)", "#e67e22");
+
+    // 3. URL（排在路径前：URL 也含 /，先整体吃掉）
+    add("URL", R"(\bhttps?://[^\s]+\b)", "#3498db");
+
+    // 4. 绝对路径 / ~ 路径
+    add("绝对路径", R"((?:^|[\s;])((?:/[^ \t\n]+|~[^ \t\n]+)))", "#8be9fd");
+
+    // 5. 命令行关键字
+    add("命令关键字",
+        R"((?<![\w\-])(?:sudo\s+)?(?:ls|cd|vi|vim|cat|grep|tail|head|tar|zip|unzip|ssh|scp|find|chmod|chown|ps|kill|ss|systemctl|docker|service|journalctl|top|htop|netstat|ip|ifconfig)\b)",
+        "#00A1FF");
+
+    // 6. 命令行选项（-x / --xxx）
+    add("命令选项", R"((?<!\w)(--?[a-zA-Z0-9][\w\-]*))", "#f1c40f");
+
+    // 7. 否定短语：Could not xxx / Can't xxx / not xxx / no xxx
+    //    只匹配「短语 + 紧跟的一个词」，不贪婪吞整行。
+    add("否定短语",
+        R"(\bcould\s+not\b(?:\s+\S+)?|\bcan'?t\b(?:\s+\S+)?|\bnot\s+\S+|\bno\s+\S+)",
+        "#e74c3c");
+
+    // 8. 失败 / 拒绝关键字
+    add("失败/拒绝关键字",
+        R"(\b(?:fail|failed|failure|error|errors|fatal|panic|denied|refused|rejected|aborted|cancel(?:l)?ed|disabled|disable|stopped|stop|dead|offline|unreachable|timeout|timed out|not found)\b)",
+        "#e74c3c");
+
+    // 9. 成功关键字
+    add("成功关键字",
+        R"(\b(?:success|succeeded|successful|successfully|ok|okay|done|passed|enabled|enable|started|start|running|active|online|ready)\b)",
+        "#50fa7b");
+
+    // 10. 警告关键字
+    add("警告关键字", R"(\b(?:warning|warn|deprecated|caution)\b)", "#f1c40f");
+
+    // 11. 提示关键字（不含 could：让「could not」由否定短语规则接管）
+    add("提示关键字", R"(\b(?:may|might|perhaps|possibly)\b)", "#8be9fd");
+
+    // 12. 数字兜底（最后，只给前面规则没覆盖到的独立数字上色）
+    //     匹配独立数字或文件大小等，但不匹配包含数字的文件名（file1.txt）。
+    add("数字", R"((?<!\S)\d+(?!\S))", "#bd93f9");
+
+    return rules;
+}
+
+} // namespace Konsole
+

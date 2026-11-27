@@ -20,6 +20,7 @@
 #include "serial/SerialBridge.h"
 
 #include "config/GlobalState.h"
+#include "config/HighlightRulesStore.h"
 
 #include "dialogs/SerialConnectDialog.h"   // serialcombo 辅助函数
 #include "dialogs/SerialSendDialog.h"
@@ -127,6 +128,8 @@ SerialTerminalWidget::SerialTerminalWidget(QWidget *parent)
             [this](const QString &name) { applyTerminalThemeEverywhere(name, this); });
     // 回滚缓冲行数（同时决定“查找”能检索到多久以前的输出）。
     m_term->setHistorySize(GlobalState::instance().scrollbackLines());
+    // WindTerm 风格文本正则高亮：用户保存过规则就用用户的，否则沿用内置默认。
+    applyHighlightRules(m_term);
     m_term->setScrollBarPosition(ScrollBarRight);
 
     // 不挂 TerminalCommandSuggest：命令提示是 shell 语义，串口对面

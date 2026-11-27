@@ -412,6 +412,13 @@ void FilterChain::addFilter(Filter *filter)
     append(filter);
 }
 
+// cube-shell 新增：插到链首。hotSpots() 按链序拼接，因此链首的过滤器
+// 在首匹配优先的着色逻辑中最先占住字符。
+void FilterChain::prependFilter(Filter *filter)
+{
+    prepend(filter);
+}
+
 // 对应C++: void FilterChain::removeFilter(Filter* filter)
 void FilterChain::removeFilter(Filter *filter)
 {

@@ -20,6 +20,7 @@
 #include "ssh/SshClient.h"
 
 #include "config/GlobalState.h"
+#include "config/HighlightRulesStore.h"
 #include "dialogs/HostKeyDialog.h"
 
 #include "terminal_command_suggest.h"
@@ -53,6 +54,8 @@ SshTerminalWidget::SshTerminalWidget(const DeviceEntry &device, QWidget *parent)
             [this](const QString &name) { applyTerminalThemeEverywhere(name, this); });
     // 回滚缓冲行数（同时决定“查找”能检索到多久以前的输出）。
     m_term->setHistorySize(GlobalState::instance().scrollbackLines());
+    // WindTerm 风格文本正则高亮：用户保存过规则就用用户的，否则沿用内置默认。
+    applyHighlightRules(m_term);
     m_term->setScrollBarPosition(ScrollBarRight);
 
     // 终端命令智能提示（候选弹窗 + 历史记录），历史按配置名分组。

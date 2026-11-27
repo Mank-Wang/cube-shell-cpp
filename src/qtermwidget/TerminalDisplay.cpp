@@ -1168,6 +1168,11 @@ QMap<int, QMap<int, QColor>> TerminalDisplay::_computeHighlightMap()
                 const int idx = base + col;
                 if (idx >= total)
                     break;
+                // 首匹配优先（WindTerm 风格）：过滤链靠前的规则先占住字符，
+                // 后面的规则只能给尚未着色的字符上色。规则顺序由用户设置的
+                // 列表顺序决定；搜索高亮经 prependFilter() 插在链首，始终可见。
+                if (row.contains(col))
+                    continue;
                 if (isPerm) {
                     const quint16 ch = _image[idx].character;
                     const QChar c = (ch > 0) ? QChar(ch) : QChar(QLatin1Char(' '));
